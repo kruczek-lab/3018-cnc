@@ -1,0 +1,227 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>3018 Studio</title>
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><path d='M8 1l3 7H5z' fill='%23d9480f'/><rect x='6' y='9' width='4' height='6' fill='%23555'/></svg>" />
+  </head>
+  <body>
+    <header class="topbar">
+      <h1>3018 Studio</h1>
+      <span class="subtitle">Design → G-code → GRBL, in the browser</span>
+      <span id="conn-badge" class="badge">Disconnected</span>
+    </header>
+
+    <main class="layout">
+      <!-- ─────────────── Machine ─────────────── -->
+      <aside class="panel" id="machine-panel">
+        <section>
+          <h2>Machine</h2>
+          <div class="row">
+            <button id="btn-connect" class="primary">Connect USB</button>
+            <button id="btn-simulator">Simulator</button>
+            <button id="btn-disconnect" hidden>Disconnect</button>
+          </div>
+          <p id="serial-unsupported" class="note warn" hidden>
+            This browser can't talk to USB serial devices. Open the app in Chrome or Edge, or use the simulator.
+          </p>
+        </section>
+
+        <section class="needs-connection">
+          <div class="state-line"><span>State</span><strong id="machine-state">—</strong></div>
+          <table class="dro">
+            <thead><tr><th></th><th>Work</th><th>Machine</th></tr></thead>
+            <tbody>
+              <tr><th>X</th><td id="wx">0.000</td><td id="mx">0.000</td></tr>
+              <tr><th>Y</th><td id="wy">0.000</td><td id="my">0.000</td></tr>
+              <tr><th>Z</th><td id="wz">0.000</td><td id="mz">0.000</td></tr>
+            </tbody>
+          </table>
+          <div class="grid3">
+            <button data-cmd="G10 L20 P1 X0">Zero X</button>
+            <button data-cmd="G10 L20 P1 Y0">Zero Y</button>
+            <button data-cmd="G10 L20 P1 Z0">Zero Z</button>
+            <button data-cmd="G10 L20 P1 X0 Y0" class="span2">Zero X and Y</button>
+            <button id="btn-zero-paper" title="Lower the bit until it just grips a sheet of paper on the material, then press this. Sets Z0 0.1 mm below the bit.">Z0 on paper</button>
+            <button id="btn-goto-zero" class="span2" title="Lifts to Z5 then moves to X0 Y0">Go to X0 Y0</button>
+            <button data-cmd="$X" title="Clear an alarm lock">Unlock</button>
+          </div>
+        </section>
+
+        <section class="needs-connection">
+          <h3>Jog</h3>
+          <div class="jog">
+            <button data-jog="Y" data-dir="1" class="jog-y-plus">Y+</button>
+            <button data-jog="X" data-dir="-1" class="jog-x-minus">X−</button>
+            <button data-jog="X" data-dir="1" class="jog-x-plus">X+</button>
+            <button data-jog="Y" data-dir="-1" class="jog-y-minus">Y−</button>
+            <button data-jog="Z" data-dir="1" class="jog-z-plus">Z+</button>
+            <button data-jog="Z" data-dir="-1" class="jog-z-minus">Z−</button>
+          </div>
+          <div class="row compact">
+            <label>Step
+              <select id="jog-step" data-key="jogStep">
+                <option>0.01</option><option>0.1</option><option selected>1</option><option>10</option><option>50</option>
+              </select> mm
+            </label>
+            <label>Feed <input id="jog-feed" data-key="jogFeed" type="number" value="600" min="10" max="1000" step="10" /> mm/min</label>
+          </div>
+        </section>
+
+        <section class="needs-connection">
+          <h3>Spindle</h3>
+          <div class="row compact">
+            <label>Speed <input id="spindle-s" data-key="spindleS" type="number" value="1000" min="0" max="1000" step="50" /></label>
+            <button id="btn-spindle-on">On</button>
+            <button data-cmd="M5">Off</button>
+          </div>
+        </section>
+
+        <section class="needs-connection">
+          <button id="btn-reset" class="danger wide" title="Soft reset (Ctrl-X): stops everything immediately">Reset controller</button>
+        </section>
+      </aside>
+
+      <!-- ─────────────── Preview + run ─────────────── -->
+      <section class="center">
+        <div class="tabs" role="tablist">
+          <button role="tab" data-view="toolpath" aria-selected="true">Toolpaths</button>
+          <button role="tab" data-view="print" aria-selected="false">Print preview</button>
+          <span class="legend" id="legend"></span>
+        </div>
+        <div class="canvas-wrap">
+          <canvas id="preview"></canvas>
+          <p class="canvas-hint">Scroll to zoom · drag to pan · double-click to fit</p>
+        </div>
+        <div class="runbar">
+          <div class="run-info">
+            <strong id="run-name">No file loaded</strong>
+            <span id="run-stats" class="muted"></span>
+          </div>
+          <div class="progress"><div id="run-progress"></div></div>
+          <div class="row">
+            <button id="btn-start" class="primary" disabled>Start</button>
+            <button id="btn-pause" disabled>Pause</button>
+            <button id="btn-resume" disabled>Resume</button>
+            <button id="btn-stop" class="danger" disabled>Stop</button>
+            <span id="run-time" class="muted"></span>
+          </div>
+          <p id="run-message" class="note" hidden></p>
+        </div>
+      </section>
+
+      <!-- ─────────────── Design ─────────────── -->
+      <aside class="panel" id="design-panel">
+        <section>
+          <h2>Create a job</h2>
+          <label class="block">Job type
+            <select id="job-type" data-key="jobType">
+              <option value="image">Carve an image (linocut, stamp, engraving)</option>
+              <option value="svg">Engrave lines from an SVG</option>
+              <option value="surface">Surface / flatten an area</option>
+              <option value="gcode">Open a G-code file</option>
+            </select>
+          </label>
+        </section>
+
+        <section data-job="image">
+          <label class="block">Image <input id="image-file" type="file" accept="image/*" /></label>
+          <div class="field-grid">
+            <label>Width (mm) <input id="img-width" data-key="imgWidth" type="number" value="100" min="5" max="300" step="1" /></label>
+            <label>Height (mm) <output id="img-height">—</output></label>
+            <label>Resolution (mm/px) <input id="img-res" data-key="imgRes" type="number" value="0.1" min="0.03" max="0.5" step="0.01" /></label>
+            <label>Threshold <input id="img-threshold" data-key="imgThreshold" type="range" min="1" max="254" value="128" /></label>
+          </div>
+          <label class="block">What to remove
+            <select id="img-mode" data-key="imgMode">
+              <option value="relief">Light areas — dark parts print (linocut / stamp)</option>
+              <option value="engrave">Dark areas — engrave the drawing into the surface</option>
+            </select>
+          </label>
+          <label class="check"><input id="img-mirror" data-key="imgMirror" type="checkbox" checked /> Mirror (needed for anything you print from)</label>
+
+          <fieldset>
+            <legend>Detail — V-bit</legend>
+            <div class="field-grid">
+              <label>Angle (°) <input id="v-angle" data-key="vAngle" type="number" value="30" min="10" max="120" step="1" /></label>
+              <label>Tip width (mm) <input id="v-tip" data-key="vTip" type="number" value="0.1" min="0" max="2" step="0.05" /></label>
+              <label>Depth (mm) <input id="v-depth" data-key="vDepth" type="number" value="1" min="0.1" max="5" step="0.1" /></label>
+              <label>Min depth (mm) <input id="v-min-depth" data-key="vMinDepth" type="number" value="0.2" min="0.02" max="5" step="0.05" /></label>
+              <label>Feed (mm/min) <input id="v-feed" data-key="vFeed" type="number" value="600" min="10" max="1000" step="10" /></label>
+              <label>Plunge (mm/min) <input id="v-plunge" data-key="vPlunge" type="number" value="200" min="10" max="1000" step="10" /></label>
+            </div>
+          </fieldset>
+
+          <fieldset>
+            <legend><label class="check"><input id="clear-enabled" data-key="clearEnabled" type="checkbox" checked /> Clearing — flat end mill</label></legend>
+            <div class="field-grid" id="clear-fields">
+              <label>Diameter (mm) <input id="c-diameter" data-key="cDiameter" type="number" value="3.175" min="0.5" max="8" step="0.025" /></label>
+              <label>Depth (mm) <input id="c-depth" data-key="cDepth" type="number" value="1.5" min="0.1" max="5" step="0.1" /></label>
+              <label>Stepover (%) <input id="c-stepover" data-key="cStepover" type="number" value="40" min="10" max="90" step="5" /></label>
+              <label>Depth per pass (mm) <input id="c-stepdown" data-key="cStepdown" type="number" value="1.5" min="0.1" max="5" step="0.1" /></label>
+              <label>Feed (mm/min) <input id="c-feed" data-key="cFeed" type="number" value="800" min="10" max="1000" step="10" /></label>
+              <label>Plunge (mm/min) <input id="c-plunge" data-key="cPlunge" type="number" value="200" min="10" max="1000" step="10" /></label>
+            </div>
+          </fieldset>
+        </section>
+
+        <section data-job="svg" hidden>
+          <label class="block">SVG file <input id="svg-file" type="file" accept=".svg,image/svg+xml" /></label>
+          <p class="note">The bit follows every line and shape outline. Convert text to paths in your drawing app first.</p>
+          <div class="field-grid">
+            <label>Width (mm) <input id="svg-width" data-key="svgWidth" type="number" value="100" min="5" max="300" step="1" /></label>
+            <label>Depth (mm) <input id="svg-depth" data-key="svgDepth" type="number" value="0.3" min="0.05" max="5" step="0.05" /></label>
+            <label>Depth per pass (mm) <input id="svg-stepdown" data-key="svgStepdown" type="number" value="0.5" min="0.05" max="5" step="0.05" /></label>
+            <label>Feed (mm/min) <input id="svg-feed" data-key="svgFeed" type="number" value="400" min="10" max="1000" step="10" /></label>
+            <label>Plunge (mm/min) <input id="svg-plunge" data-key="svgPlunge" type="number" value="150" min="10" max="1000" step="10" /></label>
+            <label>Tool name <input id="svg-tool" data-key="svgTool" type="text" value="30° V-bit" /></label>
+          </div>
+          <label class="check"><input id="svg-mirror" data-key="svgMirror" type="checkbox" /> Mirror (for printing blocks and stamps)</label>
+        </section>
+
+        <section data-job="surface" hidden>
+          <p class="note">Cuts a rectangle flat, starting at X0 Y0. Surfacing the spoilboard once makes shallow carving much more even.</p>
+          <div class="field-grid">
+            <label>Width X (mm) <input id="s-width" data-key="sWidth" type="number" value="150" min="1" max="300" step="1" /></label>
+            <label>Height Y (mm) <input id="s-height" data-key="sHeight" type="number" value="100" min="1" max="180" step="1" /></label>
+            <label>Tool diameter (mm) <input id="s-diameter" data-key="sDiameter" type="number" value="3.175" min="0.5" max="30" step="0.025" /></label>
+            <label>Depth (mm) <input id="s-depth" data-key="sDepth" type="number" value="0.3" min="0.05" max="5" step="0.05" /></label>
+            <label>Stepover (%) <input id="s-stepover" data-key="sStepover" type="number" value="50" min="10" max="90" step="5" /></label>
+            <label>Depth per pass (mm) <input id="s-stepdown" data-key="sStepdown" type="number" value="0.5" min="0.05" max="5" step="0.05" /></label>
+            <label>Feed (mm/min) <input id="s-feed" data-key="sFeed" type="number" value="800" min="10" max="1000" step="10" /></label>
+          </div>
+        </section>
+
+        <section data-job="gcode" hidden>
+          <label class="block">G-code file <input id="gcode-file" type="file" accept=".nc,.gcode,.gc,.ngc,.tap,.txt" /></label>
+          <p class="note">From any CAM program (Inkscape, Estlcam, Kiri:Moto, Carbide Create …). It's shown in the preview, then you can run it.</p>
+        </section>
+
+        <section data-job="image svg surface" class="shared-fields">
+          <div class="field-grid">
+            <label>Safe Z (mm) <input id="safe-z" data-key="safeZ" type="number" value="3" min="0.5" max="20" step="0.5" /></label>
+            <label>Spindle (S) <input id="job-spindle" data-key="jobSpindle" type="number" value="1000" min="0" max="1000" step="50" /></label>
+          </div>
+          <button id="btn-generate" class="primary wide">Generate G-code</button>
+          <p id="generate-message" class="note" hidden></p>
+        </section>
+
+        <section>
+          <h2>Files</h2>
+          <ol id="files" class="files"><li class="muted">Nothing yet.</li></ol>
+        </section>
+      </aside>
+    </main>
+
+    <footer class="console">
+      <div id="log" class="log" aria-live="polite"></div>
+      <form id="console-form" class="row">
+        <input id="console-input" type="text" placeholder="Send a command, e.g. $$ (settings), $I (version), G0 X10" autocomplete="off" spellcheck="false" />
+        <button type="submit">Send</button>
+      </form>
+    </footer>
+
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
