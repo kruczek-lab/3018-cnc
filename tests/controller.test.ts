@@ -39,6 +39,10 @@ describe('GrblController streaming', () => {
       t.reply('ok');
     }
     expect(t.written).toEqual(lines);
+    // Every line is planned, but the machine is still moving.
+    t.reply('<Run|MPos:1.000,0.000,0.000|FS:500,0>');
+    expect(c.job!.status).toBe('running');
+    t.reply('<Idle|MPos:49.123,49.456,0.000|FS:0,0>');
     expect(c.job!.status).toBe('finished');
   });
 
@@ -51,6 +55,7 @@ describe('GrblController streaming', () => {
     expect(t.realtime).toContain('!'.charCodeAt(0));
     c.resumeJob();
     t.reply('ok');
+    t.reply('<Idle|MPos:3.000,0.000,0.000|FS:0,0>');
     expect(c.job!.status).toBe('finished');
   });
 

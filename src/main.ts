@@ -1,5 +1,7 @@
 import './style.css';
-import { GrblController, type LogKind } from './machine/controller';
+import { GrblController, type JobView, type LogKind } from './machine/controller';
+import type { MachineClient } from './machine/client';
+import { RemoteMachine, detectRemote } from './remote/remoteMachine';
 import { WebSerialTransport } from './machine/webSerialTransport';
 import { SimulatedGrbl } from './machine/simulator';
 import { prepareProgram } from './gcode/clean';
@@ -57,7 +59,10 @@ document.addEventListener('change', (e) => {
 
 // ───────────────────────── controller + log ─────────────────────────
 
-const controller = new GrblController();
+// Served by the Pi server → drive the machine attached to the Pi; otherwise talk USB from this browser.
+const remote = (await detectRemote()) ? new RemoteMachine() : null;
+const local = remote ? null : new GrblController();
+const controller: MachineClient = remote ?? local!;
 const logEl = $('log');
 function log(kind: LogKind, text: string) {
   const line = document.createElement('div');
@@ -69,7 +74,9 @@ function log(kind: LogKind, text: string) {
   if (atBottom) logEl.scrollTop = logEl.scrollHeight;
 }
 controller.onLog(log);
-log('info', 'Welcome. Connect the machine over USB (Chrome or Edge), or try the simulator.');
+log('info', remote
+  ? 'Running from the Raspberry Pi. Jobs run on the Pi, so you can close this page while it carves.'
+  : 'Welcome. Connect the machine over USB (Chrome or Edge), or try the simulator.');
 
 async function send(command: string) {
   try {
@@ -82,20 +89,26 @@ async function send(command: string) {
 
 // ───────────────────────── machine panel ─────────────────────────
 
-if (!WebSerialTransport.isSupported()) {
+if (remote) {
+  $('btn-connect').textContent = 'Connect machine';
+  $('btn-connect').title = 'Connect to the 3018 plugged into the Pi';
+  $('btn-simulator').title = 'Run the simulator on the Pi';
+  $('mode').textContent = 'Connected through the Raspberry Pi';
+} else if (!WebSerialTransport.isSupported()) {
   $('serial-unsupported').hidden = false;
   $<HTMLButtonElement>('btn-connect').disabled = true;
 }
 
-async function connect(transport: WebSerialTransport | SimulatedGrbl) {
+async function connect(simulator: boolean) {
+  if (remote) return remote.connect(simulator);
   try {
-    await controller.connect(transport);
+    await local!.connect(simulator ? new SimulatedGrbl() : new WebSerialTransport());
   } catch (e) {
     if ((e as Error)?.name !== 'NotFoundError') log('error', `Could not connect: ${(e as Error).message ?? e}`);
   }
 }
-$('btn-connect').addEventListener('click', () => connect(new WebSerialTransport()));
-$('btn-simulator').addEventListener('click', () => connect(new SimulatedGrbl()));
+$('btn-connect').addEventListener('click', () => connect(false));
+$('btn-simulator').addEventListener('click', () => connect(true));
 $('btn-disconnect').addEventListener('click', () => controller.disconnect());
 
 document.querySelectorAll<HTMLButtonElement>('[data-cmd]').forEach((b) => b.addEventListener('click', () => send(b.dataset.cmd!)));
@@ -442,7 +455,7 @@ $('btn-generate').addEventListener('click', generate);
 
 // ───────────────────────── run bar ─────────────────────────
 
-$('btn-start').addEventListener('click', () => {
+$('btn-start').addEventListener('click', async () => {
   if (!active) return;
   const m = controller.machine;
   if (m.state.startsWith('Alarm')) {
@@ -460,19 +473,21 @@ $('btn-start').addEventListener('click', () => {
     b ? `\nIt cuts ${(b.max[0] - b.min[0]).toFixed(1)} × ${(b.max[1] - b.min[1]).toFixed(1)} mm, down to Z${fmt(b.min[2])}.` : '',
   ];
   if (!confirm(checklist.join('\n'))) return;
-  controller.startJob(active.name, active.lines);
+  await controller.startJob(active.name, active.lines);
 });
 $('btn-pause').addEventListener('click', () => controller.pauseJob());
 $('btn-resume').addEventListener('click', () => controller.resumeJob());
 $('btn-stop').addEventListener('click', () => controller.stopJob());
 
+const isJobFile = (job: JobView | null, file: JobFile | null) => !!job && !!file && job.name === file.name && job.total === file.lines.length;
+
 function renderRun() {
   const job = controller.job;
   const running = controller.jobActive;
-  const showingJob = job && (running || job.name === active?.name);
+  const showingJob = job && (running || isJobFile(job, active));
   $('run-name').textContent = showingJob ? job!.name : active?.name ?? 'No file loaded';
   $('run-stats').textContent = active ? describe(active) : '';
-  const fraction = showingJob && job!.lines.length ? job!.acked / job!.lines.length : 0;
+  const fraction = showingJob && job!.total ? job!.acked / job!.total : 0;
   $('run-progress').style.width = `${(fraction * 100).toFixed(1)}%`;
   $<HTMLButtonElement>('btn-start').disabled = !active || !controller.connected || running;
   $<HTMLButtonElement>('btn-pause').disabled = job?.status !== 'running';
@@ -492,18 +507,20 @@ function renderRun() {
   msg.hidden = !(showingJob && job!.message);
   msg.textContent = job?.message ?? '';
   msg.className = `note ${job?.status === 'finished' ? '' : 'error'}`;
-  preview.setProgress(showingJob && job!.lines === active?.lines ? job!.acked : -1);
+  preview.setProgress(isJobFile(job, active) ? job!.acked : -1);
 }
 
 function renderMachine() {
   const m = controller.machine;
-  document.body.classList.toggle('connected', m.connected);
-  $('btn-connect').hidden = m.connected;
-  $('btn-simulator').hidden = m.connected;
-  $('btn-disconnect').hidden = !m.connected;
+  const connected = controller.connected;
+  document.body.classList.toggle('connected', connected);
+  $('btn-connect').hidden = connected;
+  $('btn-simulator').hidden = connected;
+  $('btn-disconnect').hidden = !connected;
   const badge = $('conn-badge');
-  badge.textContent = m.connected ? `${m.transportName} · ${m.state}` : 'Disconnected';
-  badge.className = `badge ${m.state.startsWith('Alarm') ? 'alarm' : m.connected ? 'on' : ''}`;
+  const where = remote ? 'Pi · ' : '';
+  badge.textContent = remote && !remote.online ? 'Pi unreachable' : connected ? `${where}${m.transportName} · ${m.state}` : `${where}Disconnected`;
+  badge.className = `badge ${m.state.startsWith('Alarm') || (remote && !remote.online) ? 'alarm' : connected ? 'on' : ''}`;
   $('machine-state').textContent = m.state;
   (['x', 'y', 'z'] as const).forEach((axis, i) => {
     $(`w${axis}`).textContent = fmt(m.wpos[i]);
@@ -513,7 +530,38 @@ function renderMachine() {
   const locked = controller.jobActive;
   document.querySelectorAll<HTMLButtonElement>('#machine-panel .needs-connection button:not(#btn-reset)').forEach((b) => (b.disabled = locked));
   $<HTMLInputElement>('console-input').disabled = locked;
-  preview.setTool(m.connected ? m.wpos : null);
+  preview.setTool(connected ? m.wpos : null);
+  if (remote) void followRemoteJob();
+}
+
+/** When a job was started from another device, fetch its G-code so this one can show the preview too. */
+let fetchingProgram = false;
+async function followRemoteJob() {
+  const job = controller.job;
+  if (!remote || !job || !controller.jobActive || fetchingProgram) return;
+  const existing = files.find((f) => isJobFile(job, f));
+  if (existing) {
+    if (active !== existing) {
+      active = existing;
+      preview.setProgram(existing.info, existing.block);
+      renderFiles();
+      renderRun();
+    }
+    return;
+  }
+  fetchingProgram = true;
+  try {
+    const program = await remote.program();
+    const file = addFile(program.name, program.text, '', null, null);
+    active = file;
+    preview.setProgram(file.info, null);
+    renderFiles();
+    renderRun();
+  } catch {
+    /* try again on the next update */
+  } finally {
+    fetchingProgram = false;
+  }
 }
 
 let scheduled = false;

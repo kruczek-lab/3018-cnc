@@ -18,9 +18,11 @@ export interface MachineState {
 
 export type JobStatus = 'running' | 'paused' | 'finished' | 'stopped' | 'error';
 
-export interface JobState {
+/** A job as seen from outside the controller (and over the network, where the lines are not sent). */
+export interface JobView {
   name: string;
-  lines: string[];
+  /** Number of lines in the job. */
+  total: number;
   sent: number;
   acked: number;
   status: JobStatus;
@@ -29,6 +31,10 @@ export interface JobState {
   finishedAt?: number;
   pausedMs: number;
   pauseStartedAt?: number;
+}
+
+export interface JobState extends JobView {
+  lines: string[];
 }
 
 export type LogKind = 'tx' | 'rx' | 'info' | 'error';
@@ -150,9 +156,8 @@ export class GrblController {
   startJob(name: string, lines: string[]): void {
     if (!this.transport) throw new Error('Not connected');
     if (this.jobActive) throw new Error('A job is already running');
-    this.job = { name, lines, sent: 0, acked: 0, status: 'running', startedAt: Date.now(), pausedMs: 0 };
+    this.job = { name, lines, total: lines.length, sent: 0, acked: 0, status: 'running', startedAt: Date.now(), pausedMs: 0 };
     this.log('info', `Job started: ${name} (${lines.length} lines)`);
-    if (lines.length === 0) this.finishJob('finished');
     this.pump();
     this.emit();
   }
@@ -266,7 +271,9 @@ export class GrblController {
     const job = this.job;
     if (command?.job && job) {
       job.acked++;
-      if (job.acked === job.lines.length && this.jobActive) this.finishJob('finished');
+      // GRBL acknowledges a line when it is planned, not when it has been cut; the job is
+      // done once everything is acknowledged and the machine reports Idle (see applyStatus).
+      if (job.acked === job.total && job.status === 'running') this.log('info', 'All lines sent; finishing the last moves…');
     }
     command?.resolve?.(line);
     this.pump();
@@ -285,6 +292,8 @@ export class GrblController {
     }
     if (status.feed !== undefined) m.feed = status.feed;
     if (status.spindle !== undefined) m.spindle = status.spindle;
+    const job = this.job;
+    if (job?.status === 'running' && job.acked === job.total && status.state === 'Idle') this.finishJob('finished');
   }
 
   private handleClosed(error?: unknown): void {

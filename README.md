@@ -17,6 +17,13 @@ type just produces G-code, and any G-code file from other software can be run to
 There is also a **simulator**: a pretend GRBL machine in the browser, for trying things out with
 no machine attached.
 
+## Two ways to run it
+
+- **On your computer**, with the 3018 plugged into it by USB. Needs Chrome or Edge, and the
+  computer has to stay awake until a job finishes. See *Using it* below.
+- **On a Raspberry Pi** next to the machine. Use it from any browser on your network (phone
+  included), and close the laptop once a job has started. See **[pi/README.md](pi/README.md)**.
+
 ## Using it
 
 1. Open the app in **Chrome or Edge** (Safari and Firefox can't talk to USB serial devices).
@@ -70,8 +77,9 @@ what has been cut, so redundant passes are skipped and anything left is shown in
 ```sh
 npm install
 npm run dev      # http://localhost:5173
-npm test         # unit tests (planner, G-code, GRBL streaming, simulator)
-npm run build    # static site in dist/
+npm test         # unit tests (planner, G-code, GRBL streaming, simulator, Pi server)
+npm run build    # typecheck, static site in dist/, Pi server in dist-server/
+npm start        # run the Pi server locally: http://localhost:8018
 ```
 
 Code layout:
@@ -84,7 +92,12 @@ Code layout:
 - `src/cam/`: design → toolpaths. `carve.ts` (image carving), `svgLines.ts`, `surfacing.ts`, and
   `operation.ts` which writes G-code. New job types go here; they only need to produce an
   `Operation`.
-- `src/ui/preview.ts`, `src/main.ts`: the interface.
+- `src/ui/preview.ts`, `src/main.ts`: the interface. `src/machine/client.ts` is what the interface
+  needs from a machine; `src/remote/remoteMachine.ts` provides it over the network.
+- `server/`: the Raspberry Pi server. It runs the same `GrblController` next to the machine
+  (`linuxSerial.ts` opens the USB port with `stty`, no native modules) and serves the app plus a
+  small JSON API and a Server-Sent Events stream of state and log. `pi/install.sh` installs it
+  as a systemd service.
 
 ### Hosting
 
