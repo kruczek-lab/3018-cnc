@@ -7,6 +7,7 @@ import { StudioServer } from '../server/studio';
 import { LinuxSerialTransport } from '../server/linuxSerial';
 import { GrblController } from '../src/machine/controller';
 import { SimulatedGrbl } from '../src/machine/simulator';
+import type { SystemActions, SystemInfo } from '../server/system';
 
 const until = async (cond: () => boolean | Promise<boolean>, ms = 8000) => {
   const start = Date.now();
@@ -22,10 +23,10 @@ afterEach(async () => {
   studio = null;
 });
 
-async function start(password?: string) {
+async function start(password?: string, system?: SystemActions) {
   const dir = mkdtempSync(join(tmpdir(), 'studio-'));
   writeFileSync(join(dir, 'index.html'), '<h1>app</h1>');
-  studio = new StudioServer({ staticDir: dir, password });
+  studio = new StudioServer({ staticDir: dir, password, system });
   const port = await studio.listen(0, '127.0.0.1');
   const base = `http://127.0.0.1:${port}`;
   let cookie = '';
@@ -93,6 +94,58 @@ describe('StudioServer', () => {
     expect(await (await fetch(base + '/')).text()).toBe('<h1>app</h1>');
     expect((await fetch(base + '/..%2f..%2fetc%2fpasswd')).status).toBe(403);
     expect((await fetch(base + '/missing.js')).status).toBe(404);
+  });
+});
+
+class FakeSystem implements SystemActions {
+  calls: string[] = [];
+  blockers: Pick<SystemInfo, 'updateBlocker' | 'powerBlocker'> = { updateBlocker: null, powerBlocker: null };
+  async info(): Promise<SystemInfo> {
+    return { version: { commit: 'abc1234', date: '2026-11-07T10:00:00Z', subject: 'Test', branch: 'main' }, ...this.blockers };
+  }
+  async checkForUpdates() {
+    return { behind: 1, commits: ['def5678 Add something'] };
+  }
+  async startUpdate() {
+    this.calls.push('update');
+  }
+  async power(action: 'poweroff' | 'reboot') {
+    this.calls.push(action);
+  }
+}
+
+describe('Pi system actions', () => {
+  it('shuts down only when no job runs, switching the spindle off first', async () => {
+    const system = new FakeSystem();
+    const { api } = await start(undefined, system);
+    await api('/api/connect', { simulator: true });
+    await until(async () => (await api('/api/state')).body.machine.state === 'Idle');
+    await api('/api/job/start', { name: 'long', gcode: 'G1 X50 F100\nG1 X0' });
+    expect((await api('/api/system/power', { action: 'poweroff' })).status).toBe(409);
+    await api('/api/job/stop', {});
+    expect((await api('/api/system/power', { action: 'format-disk' })).status).toBe(400);
+    expect((await api('/api/system/power', { action: 'poweroff' })).status).toBe(202);
+    const state = (await api('/api/state')).body;
+    expect(state.machine.connected).toBe(false);
+    await until(() => system.calls.includes('poweroff'));
+  });
+
+  it('reports versions, checks for and starts updates, and refuses when not set up', async () => {
+    const system = new FakeSystem();
+    const { api } = await start(undefined, system);
+    expect((await api('/api/system')).body.version.commit).toBe('abc1234');
+    expect((await api('/api/system/check-updates', {})).body.behind).toBe(1);
+    expect((await api('/api/system/update', {})).status).toBe(202);
+    expect(system.calls).toEqual(['update']);
+    system.blockers = { updateBlocker: 'not a git install', powerBlocker: 'run install.sh' };
+    expect((await api('/api/system/update', {})).body.error).toBe('not a git install');
+    expect((await api('/api/system/power', { action: 'reboot' })).body.error).toBe('run install.sh');
+    expect(system.calls).toEqual(['update']);
+  });
+
+  it('is unavailable without system actions', async () => {
+    const { api } = await start();
+    expect((await api('/api/system/power', { action: 'reboot' })).status).toBe(501);
   });
 });
 

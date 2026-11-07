@@ -3,6 +3,7 @@ import { networkInterfaces, hostname } from 'node:os';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { StudioServer } from './studio';
+import { PiSystem } from './system';
 
 // Settings come from environment variables (see pi/3018-studio.env.example).
 const here = dirname(fileURLToPath(import.meta.url));
@@ -17,6 +18,7 @@ const studio = new StudioServer({
   staticDir,
   serialPort: process.env.STUDIO_SERIAL_PORT || undefined,
   password: process.env.STUDIO_PASSWORD || undefined,
+  system: new PiSystem(resolve(here, '..')),
 });
 
 const listening = await studio.listen(port, process.env.STUDIO_HOST ?? '0.0.0.0');

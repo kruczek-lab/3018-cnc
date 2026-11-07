@@ -167,6 +167,8 @@ fieldset.disabled .field-grid { opacity: 0.45; pointer-events: none; }
 .dro tbody td:nth-child(2) { font-size: 1.25rem; font-weight: 600; }
 .dro tbody td:nth-child(3) { color: var(--muted); }
 
+.pi-power { margin-top: 0.6rem; }
+#pi-update-info { white-space: pre-line; }
 .grid3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 0.35rem; }
 .grid3 button { padding: 0.4rem 0.2rem; font-size: 0.85rem; }
 .span2 { grid-column: span 2; }
@@ -187,6 +189,7 @@ fieldset.disabled .field-grid { opacity: 0.45; pointer-events: none; }
 .jog-z-minus { grid-area: zm; }
 
 body:not(.connected) .needs-connection { opacity: 0.45; pointer-events: none; }
+#pi-section.locked button { opacity: 0.45; pointer-events: none; }
 
 .center { display: flex; flex-direction: column; gap: 0.5rem; min-width: 0; min-height: 0; }
 .tabs { display: flex; gap: 0.3rem; align-items: center; }

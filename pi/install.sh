@@ -7,6 +7,8 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 APP_DIR="$(pwd)"
 SERVICE=/etc/systemd/system/3018-studio.service
+UPDATE_SERVICE=/etc/systemd/system/3018-studio-update.service
+SUDOERS=/etc/sudoers.d/3018-studio
 SETTINGS=/etc/default/3018-studio
 
 if [ "$(id -u)" -eq 0 ]; then
@@ -15,11 +17,12 @@ if [ "$(id -u)" -eq 0 ]; then
 fi
 APP_USER="$(id -un)"
 
-echo "==> Checking Node.js"
+echo "==> Checking Node.js and git"
 if ! command -v node >/dev/null || [ "$(node -p 'process.versions.node.split(".")[0]')" -lt 18 ]; then
   sudo apt-get update
   sudo apt-get install -y nodejs npm
 fi
+command -v git >/dev/null || sudo apt-get install -y git
 echo "    Node $(node --version)"
 
 if [ -f dist/index.html ] && [ -f dist-server/main.js ] && [ "${REBUILD:-0}" != "1" ]; then
@@ -34,8 +37,10 @@ else
   fi
   echo "==> Installing build tools (a few minutes on a Pi)"
   npm ci --no-audit --no-fund
+  sha256sum package-lock.json | cut -d' ' -f1 > node_modules/.studio-lock-hash
   echo "==> Building"
   npm run build:pi
+  if [ -d .git ]; then git rev-parse HEAD > dist-server/BUILT_FROM; fi
 fi
 
 echo "==> Settings in $SETTINGS"
@@ -49,7 +54,34 @@ fi
 echo "==> Allowing $APP_USER to use USB serial ports"
 sudo usermod -aG dialout "$APP_USER"
 
+SYSTEMCTL="$(readlink -f "$(command -v systemctl)")"
+
+echo "==> Allowing the app to shut down, restart and update the Pi (and nothing else)"
+rules="$(mktemp)"
+cat > "$rules" <<RULES
+# Written by 3018 Studio's pi/install.sh: lets the app's buttons shut down,
+# restart and update the Pi. Remove this file to take that away.
+$APP_USER ALL=(root) NOPASSWD: $SYSTEMCTL poweroff, $SYSTEMCTL reboot, $SYSTEMCTL start --no-block 3018-studio-update.service, $SYSTEMCTL restart 3018-studio
+RULES
+if sudo visudo -cqf "$rules"; then
+  sudo install -m 440 -o root -g root "$rules" "$SUDOERS"
+else
+  echo "    Skipped: the permission rules did not validate"
+fi
+rm -f "$rules"
+
 echo "==> Installing the service"
+sudo tee "$UPDATE_SERVICE" >/dev/null <<UNIT
+[Unit]
+Description=Update 3018 Studio from GitHub
+
+[Service]
+Type=oneshot
+User=$APP_USER
+WorkingDirectory=$APP_DIR
+Environment=STUDIO_SYSTEMCTL=$SYSTEMCTL
+ExecStart=/bin/bash $APP_DIR/pi/update.sh
+UNIT
 sudo tee "$SERVICE" >/dev/null <<UNIT
 [Unit]
 Description=3018 Studio (CNC controller web app)
@@ -61,6 +93,7 @@ User=$APP_USER
 SupplementaryGroups=dialout
 WorkingDirectory=$APP_DIR
 EnvironmentFile=-$SETTINGS
+Environment=STUDIO_SYSTEMCTL=$SYSTEMCTL
 ExecStart=$(command -v node) $APP_DIR/dist-server/main.js
 Restart=always
 RestartSec=3

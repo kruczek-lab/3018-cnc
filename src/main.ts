@@ -530,6 +530,7 @@ function renderMachine() {
   const locked = controller.jobActive;
   document.querySelectorAll<HTMLButtonElement>('#machine-panel .needs-connection button:not(#btn-reset)').forEach((b) => (b.disabled = locked));
   $<HTMLInputElement>('console-input').disabled = locked;
+  $('pi-section').classList.toggle('locked', locked);
   preview.setTool(connected ? m.wpos : null);
   if (remote) void followRemoteJob();
 }
@@ -562,6 +563,99 @@ async function followRemoteJob() {
   } finally {
     fetchingProgram = false;
   }
+}
+
+// ───────────────────────── Raspberry Pi ─────────────────────────
+
+if (remote) {
+  const note = (id: string, text: string, kind = '') => {
+    const el = $(id);
+    el.hidden = !text;
+    el.textContent = text;
+    el.className = `note ${kind}`;
+  };
+  let commit: string | null = null;
+  let updating = false;
+
+  const refresh = async () => {
+    try {
+      const info = await remote.systemInfo();
+      const v = info.version;
+      $('pi-version').textContent = v
+        ? `Version ${v.commit} (${new Date(v.date).toLocaleDateString()}, ${v.branch}): ${v.subject}`
+        : 'Version unknown';
+      if (commit && v && v.commit !== commit) location.reload();
+      commit ??= v?.commit ?? null;
+      $<HTMLButtonElement>('btn-pi-check').disabled = !!info.updateBlocker;
+      $<HTMLButtonElement>('btn-pi-reboot').disabled = !!info.powerBlocker;
+      $<HTMLButtonElement>('btn-pi-shutdown').disabled = !!info.powerBlocker;
+      if (info.updateBlocker) note('pi-update-info', info.updateBlocker, 'warn');
+      if (info.powerBlocker) note('pi-power-info', `Shut down / restart: ${info.powerBlocker}`, 'warn');
+    } catch {
+      $('pi-version').textContent = 'This Pi does not support updates and power controls yet.';
+    }
+  };
+  $('pi-section').hidden = false;
+  void refresh();
+  remote.onReconnect = () => void refresh();
+
+  $('btn-pi-check').addEventListener('click', async () => {
+    const button = $<HTMLButtonElement>('btn-pi-check');
+    button.disabled = true;
+    note('pi-update-info', 'Checking…');
+    try {
+      const { behind, commits } = await remote.checkForUpdates();
+      $('btn-pi-update').hidden = behind === 0;
+      note('pi-update-info', behind === 0
+        ? 'Up to date.'
+        : `${behind} update${behind === 1 ? '' : 's'} available:\n${commits.map((c) => '• ' + c.replace(/^\w+ /, '')).join('\n')}`);
+    } catch (e) {
+      note('pi-update-info', `Could not check: ${(e as Error).message}`, 'error');
+    } finally {
+      button.disabled = false;
+    }
+  });
+
+  $('btn-pi-update').addEventListener('click', async () => {
+    if (updating || !confirm('Install the update on the Pi?\n\nIt takes a few minutes (longer if new build tools are needed). The machine is disconnected and this page reloads when it is done.')) return;
+    try {
+      await remote.update();
+      updating = true;
+      $('btn-pi-update').hidden = true;
+      note('pi-update-info', 'Updating… this page reloads by itself when the Pi is back.');
+      // The Pi restarts the server at the end; keep checking for the new version.
+      const poll = setInterval(async () => {
+        try {
+          const info = await remote.systemInfo();
+          if (info.version && info.version.commit !== commit) {
+            clearInterval(poll);
+            location.reload();
+          }
+        } catch {
+          /* still restarting */
+        }
+      }, 5000);
+    } catch (e) {
+      note('pi-update-info', (e as Error).message, 'error');
+    }
+  });
+
+  const power = async (action: 'poweroff' | 'reboot') => {
+    const question = action === 'poweroff'
+      ? 'Shut down the Pi?\n\nThe spindle is switched off and the machine disconnected. Wait until the green light on the Pi stops flashing (about 30 seconds) before unplugging its power. To start it again, unplug and plug the power back in.'
+      : 'Restart the Pi?\n\nThe machine is disconnected; the page reconnects in a minute or two.';
+    if (!confirm(question)) return;
+    try {
+      await remote.power(action);
+      note('pi-power-info', action === 'poweroff'
+        ? 'Shutting down. Safe to unplug once the green light on the Pi stops flashing.'
+        : 'Restarting… this page reconnects by itself.');
+    } catch (e) {
+      note('pi-power-info', (e as Error).message, 'error');
+    }
+  };
+  $('btn-pi-shutdown').addEventListener('click', () => power('poweroff'));
+  $('btn-pi-reboot').addEventListener('click', () => power('reboot'));
 }
 
 let scheduled = false;

@@ -81,6 +81,21 @@
         <section class="needs-connection">
           <button id="btn-reset" class="danger wide" title="Soft reset (Ctrl-X): stops everything immediately">Reset controller</button>
         </section>
+
+        <section id="pi-section" hidden>
+          <h3>Raspberry Pi</h3>
+          <p id="pi-version" class="note">—</p>
+          <div class="row">
+            <button id="btn-pi-check">Check for updates</button>
+            <button id="btn-pi-update" class="primary" hidden>Install update</button>
+          </div>
+          <p id="pi-update-info" class="note" hidden></p>
+          <div class="row pi-power">
+            <button id="btn-pi-reboot">Restart Pi</button>
+            <button id="btn-pi-shutdown" class="danger">Shut down Pi</button>
+          </div>
+          <p id="pi-power-info" class="note" hidden></p>
+        </section>
       </aside>
 
       <!-- ─────────────── Preview + run ─────────────── -->

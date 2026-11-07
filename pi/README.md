@@ -40,21 +40,20 @@ The model is printed on the board, e.g. "Raspberry Pi 3 Model B+". Use a proper 
    Answer `yes` to the question about authenticity, then type the Pi's password (nothing
    shows while you type). The prompt changes to `yourname@cnc:~ $`. You're now typing on the Pi.
 
-## 3. Copy the app to the Pi
+## 3. Download the app onto the Pi
 
-Open a **second** Terminal window on the Mac (⌘N), and copy the zip across. Type `scp `
-(with a space), drag the zip file into the window, then type ` yourname@cnc.local:` and press
-Return:
+In the same window (logged in to the Pi), type these two lines:
 ```
-scp /Users/you/Downloads/3018-cnc-claude-grbl-web-app.zip yourname@cnc.local:
+sudo apt-get install -y git
+git clone --branch claude/grbl-web-app https://github.com/kruczek-lab/3018-cnc.git studio
 ```
-Back in the **first** window (the Pi), unpack it:
+The first installs git, a tool for downloading and updating code. The second downloads the app
+into a folder called `studio`. Then go into that folder:
 ```
-sudo apt-get install -y unzip
-unzip 3018-cnc-*.zip
-mv 3018-cnc-*/ studio
 cd studio
 ```
+
+Downloading it this way (rather than copying a zip) is what lets the Pi update itself later.
 
 ## 4. Install
 
@@ -90,24 +89,60 @@ sudo systemctl restart 3018-studio
 ```
 Each browser asks for it once.
 
+## Shutting down and restarting the Pi
+
+Always shut the Pi down before unplugging it; pulling the power can damage its SD card.
+
+In the app, the **Raspberry Pi** section (under the machine controls) has **Shut down Pi** and
+**Restart Pi**. They switch the spindle off and disconnect the machine first, and they're refused
+while a job is running. After **Shut down Pi**, wait until the green light on the Pi stops
+flashing (about 30 seconds), then unplug it. To turn it back on, plug the power back in.
+
+These buttons are deliberately the only things the app can do to the Pi itself. For anything
+else, log in with ssh.
+
+## Updating
+
+In the app's **Raspberry Pi** section press **Check for updates**. If there are any, it lists
+them; press **Install update**. The Pi downloads and builds the new version (a few minutes on
+a Pi 3) while the old one keeps running, then switches over and the page reloads by itself.
+If anything goes wrong, the old version simply carries on. Updates are refused while a job runs.
+
+The same from ssh, showing the progress:
+```
+cd ~/studio
+bash pi/update.sh
+```
+If an update ever says *"this update changed the installer"*, run `bash pi/install.sh` once.
+
+**Switching to the main version later.** The app currently comes from the `claude/grbl-web-app`
+branch. Once it's merged into `main`, switch the Pi over with:
+```
+cd ~/studio
+git switch main
+bash pi/update.sh
+```
+
 ## Everyday commands (on the Pi, over ssh)
 
 | What | Command |
 | --- | --- |
 | See what it's doing | `journalctl -u 3018-studio -f` (Ctrl-C to stop watching) |
-| Restart it | `sudo systemctl restart 3018-studio` |
+| See how the last update went | `journalctl -u 3018-studio-update -n 50` |
+| Restart the app | `sudo systemctl restart 3018-studio` |
 | Stop it / start it | `sudo systemctl stop 3018-studio` / `sudo systemctl start 3018-studio` |
 | Shut the Pi down safely | `sudo poweroff` |
 
-## Updating to a new version
+### Installed from a zip?
 
-Copy the new zip over as in step 3, then on the Pi:
+A copy installed from a zip can't update itself (the app says so). Switch to a git copy once;
+your settings and password are kept:
 ```
-rm -rf studio
-unzip 3018-cnc-*.zip && mv 3018-cnc-*/ studio && cd studio
-bash pi/install.sh
+rm -rf ~/studio
+sudo apt-get install -y git
+git clone --branch claude/grbl-web-app https://github.com/kruczek-lab/3018-cnc.git ~/studio
+cd ~/studio && bash pi/install.sh
 ```
-Your settings and password are kept.
 
 ## Troubleshooting
 
@@ -125,12 +160,15 @@ Your settings and password are kept.
 These older chips can't run the build tools, but can run the finished app. On the Mac, in the
 project folder, run `npm install && npm run build:pi`. Then copy the whole folder, now with
 `dist` and `dist-server` in it, to the Pi, and run `bash pi/install.sh` there; it uses the
-ready-made build. Raspberry Pi OS Lite (32-bit) is needed on these models.
+ready-made build. Raspberry Pi OS Lite (32-bit) is needed on these models. The **Install
+update** button doesn't work on them for the same reason: update by rebuilding on the Mac
+and copying again.
 
 ## Removing it
 
 ```
 sudo systemctl disable --now 3018-studio
-sudo rm /etc/systemd/system/3018-studio.service /etc/default/3018-studio
+sudo rm /etc/systemd/system/3018-studio.service /etc/systemd/system/3018-studio-update.service
+sudo rm /etc/default/3018-studio /etc/sudoers.d/3018-studio
 rm -rf ~/studio
 ```

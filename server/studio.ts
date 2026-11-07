@@ -7,6 +7,7 @@ import { SimulatedGrbl } from '../src/machine/simulator';
 import type { Transport } from '../src/machine/transport';
 import { prepareProgram } from '../src/gcode/clean';
 import { LinuxSerialTransport, listSerialPorts } from './linuxSerial';
+import type { SystemActions } from './system';
 
 export interface StudioOptions {
   /** Folder with the built web app (dist/). */
@@ -17,6 +18,8 @@ export interface StudioOptions {
   password?: string;
   /** For tests: how to open a serial port. */
   openPort?: (path: string) => Transport;
+  /** Shutdown, restart and self-update. Without it those requests are refused. */
+  system?: SystemActions;
 }
 
 export interface LogEntry {
@@ -136,6 +139,11 @@ export class StudioServer {
     this.port = path;
   }
 
+  private requireSystem(): SystemActions {
+    if (!this.options.system) throw new HttpError(501, 'Not available on this server');
+    return this.options.system;
+  }
+
   private addLog(kind: LogKind, text: string): void {
     const entry: LogEntry = { id: this.nextLogId++, kind, text, time: Date.now() };
     this.log.push(entry);
@@ -211,6 +219,8 @@ export class StudioServer {
 
     if (req.method === 'GET') {
       switch (path) {
+        case '/api/system':
+          return this.json(res, 200, await this.requireSystem().info());
         case '/api/info':
           return this.json(res, 200, { app: '3018-studio', ports: listSerialPorts(), passwordRequired: !!this.options.password });
         case '/api/state':
@@ -270,6 +280,38 @@ export class StudioServer {
       case '/api/job/stop':
         await c.stopJob();
         return this.json(res, 200, this.state());
+      case '/api/system/check-updates':
+        return this.json(res, 200, await this.requireSystem().checkForUpdates());
+      case '/api/system/update': {
+        const system = this.requireSystem();
+        if (c.jobActive) throw new HttpError(409, 'Wait for the job to finish before updating');
+        const { updateBlocker } = await system.info();
+        if (updateBlocker) throw new HttpError(409, updateBlocker);
+        await system.startUpdate();
+        this.addLog('info', 'Updating 3018 Studio on the Pi. This takes a few minutes; the page reloads when it is done.');
+        return this.json(res, 202, { ok: true });
+      }
+      case '/api/system/power': {
+        const action = body.action;
+        if (action !== 'poweroff' && action !== 'reboot') throw new HttpError(400, 'Unknown power action');
+        const system = this.requireSystem();
+        if (c.jobActive) throw new HttpError(409, 'Stop the job before shutting down the Pi');
+        const { powerBlocker } = await system.info();
+        if (powerBlocker) throw new HttpError(409, powerBlocker);
+        if (c.connected) {
+          // Make sure the spindle is off before the Pi goes away.
+          await Promise.race([c.send('M5'), new Promise((r) => setTimeout(r, 1000))]);
+          await c.disconnect();
+          this.port = null;
+        }
+        this.addLog('info', action === 'poweroff'
+          ? 'The Pi is shutting down. It is safe to unplug once its green light has stopped flashing (about 30 seconds).'
+          : 'The Pi is restarting. This page reconnects in a minute or two.');
+        this.json(res, 202, { ok: true });
+        // Give the response and the log message a moment to reach the browsers first.
+        setTimeout(() => system.power(action).catch((error) => this.addLog('error', `Could not ${action}: ${(error as Error).message}`)), 500);
+        return;
+      }
     }
     throw new HttpError(404, 'Not found');
   }

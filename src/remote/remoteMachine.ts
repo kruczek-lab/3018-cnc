@@ -18,6 +18,12 @@ export interface RemoteInfo {
   ports: string[];
 }
 
+export interface SystemInfo {
+  version: { commit: string; date: string; subject: string; branch: string } | null;
+  updateBlocker: string | null;
+  powerBlocker: string | null;
+}
+
 async function api<T = unknown>(path: string, body?: unknown): Promise<T> {
   const res = await fetch(path, {
     method: body === undefined ? 'GET' : 'POST',
@@ -59,6 +65,8 @@ export class RemoteMachine implements MachineClient {
   port: string | null = null;
   /** Whether this browser can currently reach the Pi. */
   online = false;
+  /** Called when the Pi comes back after being unreachable (e.g. after an update or restart). */
+  onReconnect: (() => void) | null = null;
   private clockOffset = 0;
   private lastLogId = 0;
   private changeListeners = new Set<() => void>();
@@ -73,8 +81,11 @@ export class RemoteMachine implements MachineClient {
       this.lastLogId = entry.id;
       this.log(entry.kind, entry.text);
     });
+    let everOpen = false;
     events.addEventListener('open', () => {
       if (!this.online) this.log('info', 'Connected to the Pi');
+      if (everOpen && !this.online) this.onReconnect?.();
+      everOpen = true;
       this.online = true;
       this.emit();
     });
@@ -139,6 +150,23 @@ export class RemoteMachine implements MachineClient {
 
   stopJob(): Promise<void> {
     return this.call('api/job/stop', {});
+  }
+
+  systemInfo(): Promise<SystemInfo> {
+    return api('api/system');
+  }
+
+  checkForUpdates(): Promise<{ behind: number; commits: string[] }> {
+    return api('api/system/check-updates', {});
+  }
+
+  /** Starts the update on the Pi; the page should reload once the Pi is back. */
+  update(): Promise<unknown> {
+    return api('api/system/update', {});
+  }
+
+  power(action: 'poweroff' | 'reboot'): Promise<unknown> {
+    return api('api/system/power', { action });
   }
 
   /** The G-code of the current/last job, for previewing a job started from another device. */
