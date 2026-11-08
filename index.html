@@ -49,6 +49,39 @@
           </div>
         </section>
 
+        <section class="needs-connection" id="limits-section">
+          <h3>Travel limits</h3>
+          <p id="limits-status" class="note">—</p>
+          <div class="row">
+            <button id="btn-set-reference" title="Use the current position as the X−, Y−, Z-top corner of the machine">Set reference here</button>
+            <button id="btn-home" hidden title="Run the homing cycle with the limit switches ($H)">Home</button>
+            <button id="btn-clear-limits" hidden>Clear</button>
+          </div>
+          <details class="limits-settings">
+            <summary>How it works &amp; settings</summary>
+            <p class="note">
+              Without limit switches the machine doesn't know where the ends of its axes are. Once per
+              power-on, jog <strong>X−</strong> until X is at its end, <strong>Y−</strong> until Y is at its
+              end, and <strong>Z+</strong> until the spindle is at the top (use small steps near the ends;
+              a few moments of a buzzing motor at an end does no harm), then press
+              <strong>Set reference here</strong>. From then on jogs stop at the ends and jobs that would
+              run off the end are flagged before they start.
+            </p>
+            <p class="note">
+              The reference is forgotten whenever the position may be lost (alarm, restart, lost
+              connection). It can't notice skipped steps or the axes being moved by hand with the power
+              off; set it again if that happens. With limit switches fitted and homing enabled
+              (<code>$22=1</code>), use <strong>Home</strong> instead.
+            </p>
+            <div class="field-grid">
+              <label>X travel (mm) <input id="travel-x" data-key="travelX" type="number" value="300" min="10" max="2000" step="1" /></label>
+              <label>Y travel (mm) <input id="travel-y" data-key="travelY" type="number" value="180" min="10" max="2000" step="1" /></label>
+              <label>Z travel (mm) <input id="travel-z" data-key="travelZ" type="number" value="45" min="5" max="500" step="1" /></label>
+              <label>Safety margin (mm) <input id="travel-margin" data-key="travelMargin" type="number" value="1" min="0" max="20" step="0.5" /></label>
+            </div>
+          </details>
+        </section>
+
         <section class="needs-connection">
           <h3>Jog</h3>
           <div class="jog">
@@ -115,7 +148,9 @@
             <span id="run-stats" class="muted"></span>
           </div>
           <div class="progress"><div id="run-progress"></div></div>
+          <p id="run-limits" class="note" hidden></p>
           <div class="row">
+            <button id="btn-trace" disabled title="Move round the edge of the job with the bit raised and the spindle off">Trace outline</button>
             <button id="btn-start" class="primary" disabled>Start</button>
             <button id="btn-pause" disabled>Pause</button>
             <button id="btn-resume" disabled>Resume</button>

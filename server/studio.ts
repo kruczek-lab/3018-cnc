@@ -7,6 +7,8 @@ import { SimulatedGrbl } from '../src/machine/simulator';
 import type { Transport } from '../src/machine/transport';
 import { prepareProgram } from '../src/gcode/clean';
 import { LinuxSerialTransport, listSerialPorts } from './linuxSerial';
+import { LimitError } from '../src/machine/controller';
+import type { Vec3 } from '../src/machine/status';
 import type { SystemActions } from './system';
 
 export interface StudioOptions {
@@ -112,7 +114,7 @@ export class StudioServer {
     const job = this.controller.job;
     // Everything but the (possibly huge) list of lines.
     const view: JobView | null = job && {
-      name: job.name, total: job.total, sent: job.sent, acked: job.acked, status: job.status, message: job.message,
+      name: job.name, kind: job.kind, total: job.total, sent: job.sent, acked: job.acked, status: job.status, message: job.message,
       startedAt: job.startedAt, finishedAt: job.finishedAt, pausedMs: job.pausedMs, pauseStartedAt: job.pauseStartedAt,
     };
     return { machine: this.controller.machine, job: view, port: this.port, serverNow: Date.now() };
@@ -267,9 +269,37 @@ export class StudioServer {
         if (typeof body.name !== 'string' || typeof body.gcode !== 'string') throw new HttpError(400, 'Missing name or gcode');
         if (!c.connected) throw new HttpError(409, 'Machine not connected');
         if (c.jobActive) throw new HttpError(409, 'A job is already running');
-        this.program = { name: body.name, text: body.gcode };
-        c.startJob(body.name, prepareProgram(body.gcode));
+        const kind = body.kind === 'trace' ? 'trace' : 'job';
+        try {
+          c.startJob(body.name, prepareProgram(body.gcode), { kind, ignoreLimits: body.ignoreLimits === true });
+        } catch (error) {
+          if (error instanceof LimitError) throw new HttpError(409, error.message);
+          throw error;
+        }
+        if (kind === 'job') this.program = { name: body.name, text: body.gcode };
         return this.json(res, 200, this.state());
+      }
+      case '/api/limits/reference': {
+        const size = body.size;
+        const margin = Number(body.margin ?? 0);
+        if (!Array.isArray(size) || size.length !== 3 || !size.every((v) => typeof v === 'number' && v > 0) || !(margin >= 0)) {
+          throw new HttpError(400, 'Invalid travel size');
+        }
+        try {
+          c.setTravelReference(size as Vec3, margin);
+        } catch (error) {
+          throw new HttpError(409, (error as Error).message);
+        }
+        return this.json(res, 200, this.state());
+      }
+      case '/api/limits/clear':
+        c.clearLimits();
+        return this.json(res, 200, this.state());
+      case '/api/home': {
+        if (!c.connected) throw new HttpError(409, 'Machine not connected');
+        if (c.jobActive) throw new HttpError(409, 'A job is running');
+        const response = await c.home(Math.max(0, Number(body.margin ?? 0)));
+        return this.json(res, 200, { response, ...this.state() });
       }
       case '/api/job/pause':
         c.pauseJob();

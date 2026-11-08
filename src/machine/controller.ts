@@ -2,6 +2,9 @@ import type { Transport } from './transport';
 import { parseStatus, type StatusReport, type Vec3 } from './status';
 import { describeAlarm, describeError } from './errors';
 import { cleanLine } from '../gcode/clean';
+import { analyzeProgram } from '../gcode/analyze';
+import { parseWords } from '../gcode/words';
+import { checkMoves, clampJog, describeViolations, limitsFromHoming, limitsFromReference, type TravelLimits } from './travel';
 
 export interface MachineState {
   connected: boolean;
@@ -14,6 +17,10 @@ export interface MachineState {
   feed: number;
   spindle: number;
   version: string;
+  /** Where the axes can go, once a reference corner is set or the machine is homed. */
+  limits: TravelLimits | null;
+  /** GRBL's homing cycle is enabled ($22=1), i.e. limit switches are fitted. */
+  homingEnabled: boolean;
 }
 
 export type JobStatus = 'running' | 'paused' | 'finished' | 'stopped' | 'error';
@@ -21,6 +28,8 @@ export type JobStatus = 'running' | 'paused' | 'finished' | 'stopped' | 'error';
 /** A job as seen from outside the controller (and over the network, where the lines are not sent). */
 export interface JobView {
   name: string;
+  /** A real job, or the trace-outline dry run. */
+  kind: 'job' | 'trace';
   /** Number of lines in the job. */
   total: number;
   sent: number;
@@ -42,8 +51,19 @@ export type LogKind = 'tx' | 'rx' | 'info' | 'error';
 interface Command {
   line: string;
   job: boolean;
+  /** Don't echo GRBL's reply lines to the log (e.g. the automatic settings read). */
+  quiet?: boolean;
   resolve?: (response: string) => void;
 }
+
+export interface StartOptions {
+  kind?: 'job' | 'trace';
+  /** Start even though the job goes past the travel limits. */
+  ignoreLimits?: boolean;
+}
+
+/** Thrown by startJob when a job would run past the travel limits. */
+export class LimitError extends Error {}
 
 const disconnected = (): MachineState => ({
   connected: false,
@@ -55,6 +75,8 @@ const disconnected = (): MachineState => ({
   feed: 0,
   spindle: 0,
   version: '',
+  limits: null,
+  homingEnabled: false,
 });
 
 /**
@@ -74,6 +96,13 @@ export class GrblController {
   private pending: Command[] = [];
   private rxBytes = 0;
   private pollTimer: ReturnType<typeof setInterval> | undefined;
+  /** GRBL `$` settings, read on connect. */
+  settings: Record<number, number> = {};
+  private settingsRequested = false;
+  /** Where queued jogs will end up (machine coordinates), so rapid jog clicks are clamped too. */
+  private jogTarget: Vec3 | null = null;
+  /** Set when we reset GRBL while it stood still, which keeps its position. */
+  private expectReset = false;
   private changeListeners = new Set<() => void>();
   private logListeners = new Set<(kind: LogKind, text: string) => void>();
 
@@ -103,6 +132,9 @@ export class GrblController {
     );
     this.transport = transport;
     this.clearQueues();
+    this.settings = {};
+    this.settingsRequested = false;
+    this.jogTarget = null;
     this.machine = { ...disconnected(), connected: true, transportName: transport.name, state: 'Unknown' };
     this.pollTimer = setInterval(() => this.realtime('?'), GrblController.STATUS_POLL_MS);
     this.log('info', `Connected via ${transport.name}`);
@@ -118,15 +150,99 @@ export class GrblController {
   }
 
   /** Queues a command line; resolves with GRBL's response (`ok`, `error:N`, or `reset`). */
-  send(raw: string): Promise<string> {
-    const line = cleanLine(raw);
+  send(raw: string, options: { quiet?: boolean } = {}): Promise<string> {
+    let line = cleanLine(raw);
     if (!line) return Promise.resolve('ok');
     if (!this.transport) return Promise.reject(new Error('Not connected'));
-    return new Promise((resolve) => {
-      this.pending.push({ line, job: false, resolve });
-      this.log('tx', line);
+    if (line.startsWith('$J=') && this.machine.limits) {
+      const limited = this.limitJog(line);
+      if (!limited) {
+        this.log('error', 'Not jogging: that axis is at its travel limit.');
+        return Promise.resolve('error:limit');
+      }
+      line = limited;
+    }
+    const changesSetting = /^\$\d+=/.test(line);
+    return new Promise<string>((resolve) => {
+      this.pending.push({ line, job: false, quiet: options.quiet, resolve });
+      if (!options.quiet) this.log('tx', line);
       this.pump();
+    }).then((response) => {
+      if (changesSetting && response === 'ok') void this.readSettings();
+      return response;
     });
+  }
+
+  /** Re-reads GRBL's `$$` settings (homing enabled, max travel …). */
+  async readSettings(): Promise<void> {
+    this.settingsRequested = true;
+    await this.send('$$', { quiet: true });
+    this.machine.homingEnabled = this.settings[22] === 1;
+    this.emit();
+  }
+
+  /** Rewrites a jog as a relative move that stops at the travel limits, or null if it can't move at all. */
+  private limitJog(line: string): string | null {
+    const limits = this.machine.limits!;
+    const words = parseWords(line.slice(3));
+    if (!words) return line;
+    let relative = false;
+    let machineCoords = false;
+    let scale = 1;
+    let feed: number | undefined;
+    const axes: (number | undefined)[] = [undefined, undefined, undefined];
+    for (const [letter, value] of words) {
+      if (letter === 'G' && value === 91) relative = true;
+      else if (letter === 'G' && value === 53) machineCoords = true;
+      else if (letter === 'G' && value === 20) scale = 25.4;
+      else if (letter === 'F') feed = value;
+      else if (letter === 'X' || letter === 'Y' || letter === 'Z') axes['XYZ'.indexOf(letter)] = value;
+    }
+    const from = this.jogTarget ?? this.machine.mpos;
+    const delta = axes.map((v, i) => {
+      if (v === undefined) return 0;
+      const mm = v * scale;
+      if (relative) return mm;
+      return (machineCoords ? mm : mm + this.machine.wco[i]) - from[i];
+    }) as Vec3;
+    const clamped = clampJog(from, delta, limits);
+    if (clamped.every((d) => Math.abs(d) < 1e-4)) return null;
+    if (clamped.some((d, i) => Math.abs(d - delta[i]) > 1e-4)) this.log('info', 'Jog shortened to stay inside the travel limits.');
+    this.jogTarget = from.map((v, i) => v + clamped[i]) as Vec3;
+    const parts = clamped.map((d, i) => (Math.abs(d) < 1e-4 ? '' : `${'XYZ'[i]}${+d.toFixed(3)}`)).join('');
+    return `$J=G91G21${parts}F${feed !== undefined ? feed * scale : 500}`;
+  }
+
+  /** Takes the current position as the X−/Y−/Z-top corner of the machine's travel. */
+  setTravelReference(size: Vec3, margin: number): void {
+    if (!this.connected) throw new Error('Not connected');
+    if (this.machine.state !== 'Idle') throw new Error('The machine must be idle to set the reference.');
+    this.machine.limits = limitsFromReference(this.machine.mpos, size, margin);
+    this.log('info', 'Travel limits set from this corner. Jogs and jobs now stay inside them.');
+    this.emit();
+  }
+
+  clearLimits(): void {
+    this.machine.limits = null;
+    this.emit();
+  }
+
+  /** Runs GRBL's homing cycle (needs limit switches and $22=1); the limits then come from $130–$132. */
+  async home(margin: number): Promise<string> {
+    const response = await this.send('$H');
+    if (response !== 'ok') return response;
+    await this.readSettings();
+    const s = this.settings;
+    this.machine.limits = limitsFromHoming([s[130] ?? 300, s[131] ?? 180, s[132] ?? 45], margin);
+    this.log('info', 'Homed. Travel limits set from the machine settings ($130–$132).');
+    this.emit();
+    return response;
+  }
+
+  private forgetLimits(reason: string): void {
+    if (!this.machine.limits) return;
+    this.machine.limits = null;
+    this.log('error', `Travel limits cleared: ${reason}. Set the reference again (or home) before relying on them.`);
   }
 
   /** Sends a real-time command, which GRBL acts on immediately, bypassing its buffer. */
@@ -147,16 +263,23 @@ export class GrblController {
   }
 
   softReset(): void {
+    // GRBL keeps its position over a reset while standing still; mid-move it raises ALARM:3.
+    this.expectReset = ['Idle', 'Hold:0', 'Check'].includes(this.machine.state);
     this.realtime(0x18);
     this.clearQueues();
     if (this.jobActive) this.finishJob('stopped', 'Controller was reset');
     this.emit();
   }
 
-  startJob(name: string, lines: string[]): void {
+  startJob(name: string, lines: string[], options: StartOptions = {}): void {
     if (!this.transport) throw new Error('Not connected');
     if (this.jobActive) throw new Error('A job is already running');
-    this.job = { name, lines, total: lines.length, sent: 0, acked: 0, status: 'running', startedAt: Date.now(), pausedMs: 0 };
+    const limits = this.machine.limits;
+    if (limits && !options.ignoreLimits) {
+      const violations = checkMoves(analyzeProgram(lines).moves, this.machine.wco, limits);
+      if (violations.length) throw new LimitError(`From the current zero this job goes ${describeViolations(violations)}.`);
+    }
+    this.job = { name, kind: options.kind ?? 'job', lines, total: lines.length, sent: 0, acked: 0, status: 'running', startedAt: Date.now(), pausedMs: 0 };
     this.log('info', `Job started: ${name} (${lines.length} lines)`);
     this.pump();
     this.emit();
@@ -245,14 +368,21 @@ export class GrblController {
       const code = Number(line.slice(6));
       this.machine.state = 'Alarm';
       this.log('error', `${line} ${describeAlarm(code)}`);
+      this.forgetLimits('the controller raised an alarm, so its position may be off');
       if (this.jobActive) this.finishJob('error', `${line} ${describeAlarm(code)}`);
     } else if (/^Grbl\s/i.test(line)) {
       this.machine.version = line;
       this.clearQueues();
       if (this.jobActive) this.finishJob('stopped', 'Controller was reset');
+      if (!this.expectReset) this.forgetLimits('the controller restarted');
+      this.expectReset = false;
+      this.jogTarget = null;
       this.log('info', line);
+      void this.readSettings();
     } else {
-      this.log('rx', line);
+      const setting = /^\$(\d+)=(-?[\d.]+)/.exec(line);
+      if (setting) this.settings[Number(setting[1])] = Number(setting[2]);
+      if (!this.inFlight[0]?.quiet) this.log('rx', line);
     }
     this.emit();
   }
@@ -265,7 +395,7 @@ export class GrblController {
       const message = `${line} ${describeError(code)}${command ? ` (line: ${command.line})` : ''}`;
       this.log('error', message);
       if (command?.job) this.pauseJob(`${message} Resume to continue anyway, or Stop.`);
-    } else if (command && !command.job) {
+    } else if (command && !command.job && !command.quiet) {
       this.log('rx', 'ok');
     }
     const job = this.job;
@@ -292,6 +422,9 @@ export class GrblController {
     }
     if (status.feed !== undefined) m.feed = status.feed;
     if (status.spindle !== undefined) m.spindle = status.spindle;
+    if (status.state === 'Idle') this.jogTarget = null;
+    // Some boards don't restart (and greet) when the port opens; read the settings anyway.
+    if (!this.settingsRequested) void this.readSettings();
     const job = this.job;
     if (job?.status === 'running' && job.acked === job.total && status.state === 'Idle') this.finishJob('finished');
   }

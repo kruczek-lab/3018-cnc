@@ -168,6 +168,11 @@ fieldset.disabled .field-grid { opacity: 0.45; pointer-events: none; }
 .dro tbody td:nth-child(3) { color: var(--muted); }
 
 .pi-power { margin-top: 0.6rem; }
+.limits-settings { margin-top: 0.6rem; }
+.limits-settings summary { cursor: pointer; color: var(--muted); font-size: 0.85rem; }
+.limits-settings .field-grid { margin-top: 0.4rem; }
+#limits-status.set { color: var(--ok); }
+.note.ok { color: var(--ok); }
 #pi-update-info { white-space: pre-line; }
 .grid3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 0.35rem; }
 .grid3 button { padding: 0.4rem 0.2rem; font-size: 0.85rem; }

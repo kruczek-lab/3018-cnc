@@ -1,5 +1,8 @@
 import './style.css';
-import { GrblController, type JobView, type LogKind } from './machine/controller';
+import { GrblController, type JobView, type LogKind, type StartOptions } from './machine/controller';
+import { checkMoves, checkPoint, describeViolations } from './machine/travel';
+import type { Vec3 } from './machine/status';
+import { traceOutline } from './gcode/trace';
 import type { MachineClient } from './machine/client';
 import { RemoteMachine, detectRemote } from './remote/remoteMachine';
 import { WebSerialTransport } from './machine/webSerialTransport';
@@ -114,8 +117,85 @@ $('btn-disconnect').addEventListener('click', () => controller.disconnect());
 document.querySelectorAll<HTMLButtonElement>('[data-cmd]').forEach((b) => b.addEventListener('click', () => send(b.dataset.cmd!)));
 $('btn-zero-paper').addEventListener('click', () => send('G10 L20 P1 Z0.1'));
 $('btn-goto-zero').addEventListener('click', async () => {
-  if (controller.machine.wpos[2] < 5) await send('G90 G0 Z5');
+  const m = controller.machine;
+  const liftZ = Math.max(m.wpos[2], 5);
+  if (m.limits) {
+    const target: Vec3 = [m.wco[0], m.wco[1], liftZ + m.wco[2]];
+    const violations = checkPoint(target, m.limits);
+    if (violations.length) {
+      log('error', `Not moving: X0 Y0 is ${describeViolations(violations)}.`);
+      return;
+    }
+  }
+  if (m.wpos[2] < 5) await send('G90 G0 Z5');
   await send('G90 G0 X0 Y0');
+});
+
+// ───────────────────────── travel limits ─────────────────────────
+
+const travelSize = (): Vec3 => [num('travel-x'), num('travel-y'), num('travel-z')];
+const travelMargin = () => Math.max(0, num('travel-margin'));
+
+$('btn-set-reference').addEventListener('click', async () => {
+  const question = [
+    'Is the machine at the reference corner?',
+    '',
+    '• X jogged all the way to its X− end',
+    '• Y jogged all the way to its Y− end',
+    '• Z jogged all the way up (Z+)',
+    '',
+    `Travel: ${travelSize().join(' × ')} mm (change under "How it works & settings").`,
+  ].join('\n');
+  if (!confirm(question)) return;
+  try {
+    await controller.setTravelReference(travelSize(), travelMargin());
+  } catch (e) {
+    log('error', (e as Error).message);
+  }
+});
+$('btn-clear-limits').addEventListener('click', () => controller.clearLimits());
+$('btn-home').addEventListener('click', async () => {
+  try {
+    const response = await controller.home(travelMargin());
+    if (response !== 'ok') log('error', `Homing failed (${response}).`);
+  } catch (e) {
+    log('error', (e as Error).message);
+  }
+});
+
+/** The program's moves checked against the limits from the current zero: null if no limits are set. */
+function limitCheck(lines: string[]): { ok: boolean; text: string } | null {
+  const m = controller.machine;
+  if (!m.limits) return null;
+  const moves = (active && active.lines === lines ? active.info : analyzeProgram(lines)).moves;
+  const violations = checkMoves(moves, m.wco, m.limits);
+  return violations.length
+    ? { ok: false, text: `From the current zero this job goes ${describeViolations(violations)}.` }
+    : { ok: true, text: 'Fits inside the travel limits from the current zero.' };
+}
+
+/** Starts a job, asking first if it goes past the limits. Returns false if it didn't start. */
+async function startChecked(name: string, lines: string[], options: StartOptions): Promise<boolean> {
+  const check = limitCheck(lines);
+  let ignoreLimits = false;
+  if (check && !check.ok) {
+    if (!confirm(`${check.text}\n\nMove the zero, or start anyway?\n(OK = start anyway)`)) return false;
+    ignoreLimits = true;
+  }
+  try {
+    await controller.startJob(name, lines, { ...options, ignoreLimits });
+    return true;
+  } catch (e) {
+    alert((e as Error).message);
+    return false;
+  }
+}
+
+$('btn-trace').addEventListener('click', async () => {
+  const b = active?.info.cutBounds;
+  if (!active || !b) return;
+  const lift = Math.max(controller.machine.wpos[2], num('safe-z'));
+  await startChecked(`Trace outline: ${active.name}`, traceOutline(b, lift), { kind: 'trace' });
 });
 $('btn-spindle-on').addEventListener('click', () => send(`M3 S${num('spindle-s')}`));
 $('btn-reset').addEventListener('click', () => controller.softReset());
@@ -471,9 +551,10 @@ $('btn-start').addEventListener('click', async () => {
     '• Z0 is set on the top of the material',
     '• The material is held down firmly',
     b ? `\nIt cuts ${(b.max[0] - b.min[0]).toFixed(1)} × ${(b.max[1] - b.min[1]).toFixed(1)} mm, down to Z${fmt(b.min[2])}.` : '',
+    m.limits ? '' : '\nTravel limits aren\'t set, so nothing checks that it fits. "Trace outline" shows where it will go.',
   ];
   if (!confirm(checklist.join('\n'))) return;
-  await controller.startJob(active.name, active.lines);
+  await startChecked(active.name, active.lines, { kind: 'job' });
 });
 $('btn-pause').addEventListener('click', () => controller.pauseJob());
 $('btn-resume').addEventListener('click', () => controller.resumeJob());
@@ -484,12 +565,18 @@ const isJobFile = (job: JobView | null, file: JobFile | null) => !!job && !!file
 function renderRun() {
   const job = controller.job;
   const running = controller.jobActive;
-  const showingJob = job && (running || isJobFile(job, active));
+  const showingJob = job && (running || isJobFile(job, active) || (job.kind === 'trace' && job.name === `Trace outline: ${active?.name}`));
   $('run-name').textContent = showingJob ? job!.name : active?.name ?? 'No file loaded';
   $('run-stats').textContent = active ? describe(active) : '';
   const fraction = showingJob && job!.total ? job!.acked / job!.total : 0;
   $('run-progress').style.width = `${(fraction * 100).toFixed(1)}%`;
   $<HTMLButtonElement>('btn-start').disabled = !active || !controller.connected || running;
+  $<HTMLButtonElement>('btn-trace').disabled = !active?.info.cutBounds || !controller.connected || running;
+  const check = active && !running && controller.connected ? limitCheck(active.lines) : null;
+  const limitsNote = $('run-limits');
+  limitsNote.hidden = !check;
+  limitsNote.textContent = check?.text ?? '';
+  limitsNote.className = `note ${check?.ok ? 'ok' : 'warn'}`;
   $<HTMLButtonElement>('btn-pause').disabled = job?.status !== 'running';
   $<HTMLButtonElement>('btn-resume').disabled = job?.status !== 'paused';
   $<HTMLButtonElement>('btn-stop').disabled = !running;
@@ -532,6 +619,19 @@ function renderMachine() {
   $<HTMLInputElement>('console-input').disabled = locked;
   $('pi-section').classList.toggle('locked', locked);
   preview.setTool(connected ? m.wpos : null);
+  const limits = connected ? m.limits : null;
+  const status = $('limits-status');
+  status.textContent = limits
+    ? limits.source === 'homing' ? 'Set by homing. Jogs and jobs are kept inside.' : 'Set from the reference corner. Jogs and jobs are kept inside.'
+    : m.homingEnabled ? 'Not set yet: press Home.' : 'Not set: nothing stops jogs or jobs at the ends of the axes.';
+  status.className = `note ${limits ? 'set' : ''}`;
+  $('btn-clear-limits').hidden = !limits;
+  $('btn-home').hidden = !m.homingEnabled;
+  $('btn-set-reference').hidden = m.homingEnabled;
+  preview.setTravel(limits && {
+    min: limits.min.map((v, i) => v - m.wco[i]) as Vec3,
+    max: limits.max.map((v, i) => v - m.wco[i]) as Vec3,
+  });
   if (remote) void followRemoteJob();
 }
 
@@ -539,7 +639,7 @@ function renderMachine() {
 let fetchingProgram = false;
 async function followRemoteJob() {
   const job = controller.job;
-  if (!remote || !job || !controller.jobActive || fetchingProgram) return;
+  if (!remote || !job || job.kind === 'trace' || !controller.jobActive || fetchingProgram) return;
   const existing = files.find((f) => isJobFile(job, f));
   if (existing) {
     if (active !== existing) {

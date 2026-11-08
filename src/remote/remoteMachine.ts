@@ -1,4 +1,5 @@
-import type { JobView, LogKind, MachineState } from '../machine/controller';
+import type { JobView, LogKind, MachineState, StartOptions } from '../machine/controller';
+import type { Vec3 } from '../machine/status';
 import type { MachineClient } from '../machine/client';
 
 interface StateMessage {
@@ -59,7 +60,7 @@ export async function detectRemote(): Promise<RemoteInfo | null> {
 export class RemoteMachine implements MachineClient {
   machine: MachineState = {
     connected: false, transportName: '', state: 'Disconnected', mpos: [0, 0, 0], wpos: [0, 0, 0],
-    wco: [0, 0, 0], feed: 0, spindle: 0, version: '',
+    wco: [0, 0, 0], feed: 0, spindle: 0, version: '', limits: null, homingEnabled: false,
   };
   job: JobView | null = null;
   port: string | null = null;
@@ -136,8 +137,22 @@ export class RemoteMachine implements MachineClient {
     void this.call('api/reset', {});
   }
 
-  startJob(name: string, lines: string[]): Promise<void> {
-    return this.call('api/job/start', { name, gcode: lines.join('\n') });
+  async startJob(name: string, lines: string[], options: StartOptions = {}): Promise<void> {
+    this.applyState(await api<StateMessage>('api/job/start', { name, gcode: lines.join('\n'), ...options }));
+  }
+
+  async setTravelReference(size: Vec3, margin: number): Promise<void> {
+    this.applyState(await api<StateMessage>('api/limits/reference', { size, margin }));
+  }
+
+  clearLimits(): Promise<void> {
+    return this.call('api/limits/clear', {});
+  }
+
+  async home(margin: number): Promise<string> {
+    const result = await api<StateMessage & { response: string }>('api/home', { margin });
+    this.applyState(result);
+    return result.response;
   }
 
   pauseJob(): void {

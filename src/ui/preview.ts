@@ -35,6 +35,8 @@ export class PreviewCanvas {
   private print: ImageLayer | null = null;
   private doneLine = -1;
   private tool: Vec3 | null = null;
+  /** The reachable area, in work coordinates. */
+  private travel: { min: Vec3; max: Vec3 } | null = null;
   private pending = false;
 
   constructor(private canvas: HTMLCanvasElement) {
@@ -94,6 +96,14 @@ export class PreviewCanvas {
       this.tool = position;
       if (this.mode === 'toolpath') this.redraw();
     }
+  }
+
+  setTravel(travel: { min: Vec3; max: Vec3 } | null): void {
+    const t = this.travel;
+    const same = t && travel && t.min.every((v, i) => v === travel.min[i]) && t.max.every((v, i) => v === travel.max[i]);
+    if (same || (!t && !travel)) return;
+    this.travel = travel;
+    if (this.mode === 'toolpath') this.redraw();
   }
 
   setMode(mode: 'toolpath' | 'print'): void {
@@ -161,6 +171,21 @@ export class PreviewCanvas {
 
     this.drawGrid(px);
     if (this.block) this.drawLayer(this.block);
+    if (this.travel) {
+      const { min, max } = this.travel;
+      ctx.strokeStyle = css('--accent');
+      ctx.lineWidth = 1.5 * px;
+      ctx.setLineDash([6 * px, 4 * px]);
+      ctx.strokeRect(min[0], min[1], max[0] - min[0], max[1] - min[1]);
+      ctx.setLineDash([]);
+      ctx.save();
+      ctx.translate(min[0] + 4 * px, max[1] - 14 * px);
+      ctx.scale(px, -px);
+      ctx.fillStyle = css('--accent');
+      ctx.font = '12px system-ui, sans-serif';
+      ctx.fillText('Travel limits', 0, 0);
+      ctx.restore();
+    }
 
     ctx.lineCap = 'round';
     ctx.lineJoin = 'round';

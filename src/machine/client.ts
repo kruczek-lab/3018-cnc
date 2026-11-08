@@ -1,4 +1,5 @@
-import type { JobView, LogKind, MachineState } from './controller';
+import type { JobView, LogKind, MachineState, StartOptions } from './controller';
+import type { Vec3 } from './status';
 
 /**
  * What the interface needs from "the machine", whether GRBL is plugged into this computer
@@ -14,7 +15,12 @@ export interface MachineClient {
   send(line: string): Promise<string>;
   realtime(command: '?' | '!' | '~' | number): void;
   softReset(): void;
-  startJob(name: string, lines: string[]): void | Promise<void>;
+  /** Throws (LimitError locally, Error remotely) when the job would go past the travel limits. */
+  startJob(name: string, lines: string[], options?: StartOptions): void | Promise<void>;
+  setTravelReference(size: Vec3, margin: number): void | Promise<void>;
+  clearLimits(): void | Promise<void>;
+  /** Runs homing; resolves with GRBL's response. */
+  home(margin: number): Promise<string>;
   pauseJob(): void;
   resumeJob(): void;
   stopJob(): Promise<void>;

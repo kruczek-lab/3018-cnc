@@ -30,14 +30,57 @@ no machine attached.
 2. Plug in the 3018 and press **Connect USB**; pick the port (on a Mac it looks like
    `USB Serial` / `wchusbserial…`). If no port appears, install the CH340 driver from the
    chip maker, WCH. Recent macOS versions usually include it.
-3. Jog the bit to the bottom-left corner of where the design should go and press **Zero X and Y**.
-4. Set Z zero with the **paper method**: put a sheet of paper on the material, jog Z down in
+3. Optional but recommended: set the **travel limits** (see below).
+4. Jog the bit to the bottom-left corner of where the design should go and press **Zero X and Y**.
+5. Set Z zero with the **paper method**: put a sheet of paper on the material, jog Z down in
    0.1 mm then 0.01 mm steps until the bit just grips the paper, then press **Z0 on paper**.
-5. Load a file (or generate one), check the preview, press **Start**.
+6. Load a file (or generate one) and check the preview. Press **Trace outline** to watch the
+   bit, raised and with the spindle off, go round the edge of the job: it should stay on the
+   material and clear of clamps. Then press **Start**.
 
 **Pause** is a feed hold (the spindle keeps turning; **Resume** continues). **Stop** holds, waits for
 the machine to stop, then resets the controller, so the position isn't lost. **Reset controller**
 stops everything immediately.
+
+## Travel limits
+
+Without limit switches the machine doesn't know where the ends of its axes are; driving past
+one makes the motor stall and lose its position, so the rest of the job lands in the wrong place.
+The app can guard against that once it knows one corner:
+
+1. After switching on, jog **X−** until X reaches its end, **Y−** until Y reaches its end and
+   **Z+** until the spindle is at the top. Use small steps near the ends.
+2. Press **Set reference here** (in *Travel limits*).
+
+From then on:
+- jogs stop at the ends of the axes;
+- the preview shows the reachable area as a dashed rectangle;
+- the run bar says whether the selected job fits from the current zero, and **Start** asks before
+  running one that doesn't (you can still start it: the check is advice, not a lock).
+
+The travel size (300 × 180 × 45 mm for the 3018-PRO) and a safety margin are under
+*How it works & settings*. The reference is forgotten automatically whenever position may be
+lost (an alarm, a controller restart, a lost connection), and the app asks you to set it again.
+It can't notice skipped steps (e.g. cutting too fast) or the axes being turned by hand with the
+power off; set it again if either happens. Commands typed into the console aren't checked.
+
+### When you fit limit switches
+
+The same checks then come from homing, which is exact and automatic. After wiring the switches,
+type these into the console (one per line), with a hand near the power switch the first time:
+
+| Setting | Meaning |
+| --- | --- |
+| `$22=1` | Enable homing. The **Home** button appears in place of *Set reference here*. |
+| `$23=0` | Which way each axis homes. `0` = towards X+, Y+ and Z+ (switches at those ends). If an axis heads the wrong way, see the GRBL docs for the mask value. |
+| `$27=2` | Back off 2 mm from the switch after homing. |
+| `$130=300` `$131=180` `$132=45` | The travel of each axis in mm (measure yours). |
+| `$20=1` | GRBL's own soft limits: it also refuses moves past the ends, including from programs made elsewhere. |
+
+With homing enabled, GRBL starts up locked (*Alarm*) until you press **Home**. Then use the
+machine as before. Hard limits (`$21=1`, stopping instantly when a switch is touched) are often
+set off by electrical noise from the spindle on these machines; leave them off unless your
+switch wiring is shielded.
 
 ## Making a linocut
 
@@ -109,6 +152,5 @@ Serial needs HTTPS or `localhost`, which Pages provides.
 
 - Auto-levelling: probe a grid with a DIY probe (crocodile clip on the bit + foil on the work,
   wired to the board's probe pins) and warp the G-code to match a warped block.
-- Homing, once the limit switches are fitted (`$22=1`, then `$H`).
 - Multi-colour reduction prints with registration marks; text tool; laser module support.
 - Deeper clearing further from the edges; a 3-D simulation of the carved block.
