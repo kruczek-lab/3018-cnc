@@ -1,9 +1,5 @@
 import type { Bounds } from './analyze';
-
-const n = (v: number) => {
-  const s = v.toFixed(3).replace(/\.?0+$/, '');
-  return s === '-0' ? '0' : s;
-};
+import { formatNumber as n } from '../cam/operation';
 
 /**
  * A program that moves around the edge of a job with the bit raised and the spindle off,

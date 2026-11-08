@@ -1,5 +1,5 @@
 import { execFile } from 'node:child_process';
-import { closeSync, constants, openSync, read, readdirSync, realpathSync, writeSync } from 'node:fs';
+import { closeSync, constants, existsSync, openSync, read, readdirSync, realpathSync, writeSync } from 'node:fs';
 import { promisify } from 'node:util';
 import type { Transport } from '../src/machine/transport';
 
@@ -39,22 +39,25 @@ export function listSerialPorts(): string[] {
 /**
  * Serial port access with no native modules: the port is configured with `stty` and read
  * and written as a file. Reads time out every 100 ms (VMIN=0, VTIME=1) so the read loop
- * can notice when it should stop.
+ * can notice when it should stop. An unplugged USB adapter also just reads 0 bytes, so the
+ * loop checks the device is still there, and a failed write ends the connection too.
  */
 export class LinuxSerialTransport implements Transport {
   readonly name: string;
   private fd: number | null = null;
   private closing = false;
+  private failure: Error | null = null;
   private loop: Promise<void> | null = null;
 
-  constructor(readonly path: string, private baudRate = 115200) {
+  /** `configure: false` skips stty, for tests that use a plain file as the "port". */
+  constructor(readonly path: string, private baudRate = 115200, private configure = true) {
     this.name = `USB ${path}`;
   }
 
   async open(onLine: (line: string) => void, onClose: (error?: unknown) => void): Promise<void> {
     const fd = openSync(this.path, constants.O_RDWR | constants.O_NOCTTY);
     try {
-      await run('stty', ['-F', this.path, String(this.baudRate), 'raw', '-echo', '-echoe', '-echok', '-echoctl', '-echoke', 'min', '0', 'time', '1']);
+      if (this.configure) await run('stty', ['-F', this.path, String(this.baudRate), 'raw', '-echo', '-echoe', '-echok', '-echoctl', '-echoke', 'min', '0', 'time', '1']);
     } catch (error) {
       closeSync(fd);
       throw new Error(`Could not configure ${this.path}: ${(error as Error).message}`);
@@ -70,11 +73,18 @@ export class LinuxSerialTransport implements Transport {
     const buffer = Buffer.alloc(1024);
     const decoder = new TextDecoder();
     let pending = '';
+    let quietReads = 0;
     while (!this.closing) {
+      if (this.failure) throw this.failure;
       const bytes = await new Promise<number>((resolve, reject) =>
         read(fd, buffer, 0, buffer.length, null, (error, n) => (error ? reject(error) : resolve(n))),
       );
-      if (!bytes) continue;
+      if (!bytes) {
+        // About once a second of silence, make sure the device hasn't been unplugged.
+        if (++quietReads % 10 === 0 && !existsSync(this.path)) throw new Error(`${this.path} was disconnected`);
+        continue;
+      }
+      quietReads = 0;
       pending += decoder.decode(buffer.subarray(0, bytes), { stream: true });
       let newline: number;
       while ((newline = pending.indexOf('\n')) >= 0) {
@@ -99,7 +109,8 @@ export class LinuxSerialTransport implements Transport {
     try {
       writeSync(this.fd, data);
     } catch (error) {
-      console.error(`Serial write failed: ${(error as Error).message}`);
+      // EIO/ENXIO/ENODEV: the adapter is gone. The read loop reports it and closes the connection.
+      this.failure ??= new Error(`Writing to ${this.path} failed: ${(error as Error).message}`);
     }
   }
 

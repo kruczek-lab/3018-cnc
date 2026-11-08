@@ -1,5 +1,5 @@
 import { existsSync } from 'node:fs';
-import { networkInterfaces, hostname } from 'node:os';
+import { homedir, networkInterfaces, hostname } from 'node:os';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { StudioServer } from './studio';
@@ -19,6 +19,8 @@ const studio = new StudioServer({
   serialPort: process.env.STUDIO_SERIAL_PORT || undefined,
   password: process.env.STUDIO_PASSWORD || undefined,
   system: new PiSystem(resolve(here, '..')),
+  // Outside the app folder, so reinstalling or updating never touches saved files.
+  dataDir: process.env.STUDIO_DATA || resolve(homedir(), '.local/share/3018-studio'),
 });
 
 const listening = await studio.listen(port, process.env.STUDIO_HOST ?? '0.0.0.0');

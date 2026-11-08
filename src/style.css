@@ -169,6 +169,10 @@ fieldset.disabled .field-grid { opacity: 0.45; pointer-events: none; }
 
 .pi-power { margin-top: 0.6rem; }
 .limits-settings { margin-top: 0.6rem; }
+.overrides { font-size: 0.85rem; color: var(--muted); }
+.overrides strong { color: var(--text); font-variant-numeric: tabular-nums; }
+.overrides button { padding: 0.2rem 0.45rem; font-size: 0.8rem; }
+.ov-gap { margin-left: 0.6rem; }
 .limits-settings summary { cursor: pointer; color: var(--muted); font-size: 0.85rem; }
 .limits-settings .field-grid { margin-top: 0.4rem; }
 #limits-status.set { color: var(--ok); }

@@ -1,20 +1,22 @@
 import './style.css';
-import { GrblController, type JobView, type LogKind, type StartOptions } from './machine/controller';
+import { GrblController, OVERRIDES, type JobView, type LogKind, type StartOptions } from './machine/controller';
 import { checkMoves, checkPoint, describeViolations } from './machine/travel';
 import type { Vec3 } from './machine/status';
 import { traceOutline } from './gcode/trace';
+import { resumeFrom } from './gcode/resume';
 import type { MachineClient } from './machine/client';
 import { RemoteMachine, detectRemote } from './remote/remoteMachine';
 import { WebSerialTransport } from './machine/webSerialTransport';
 import { SimulatedGrbl } from './machine/simulator';
-import { prepareProgram } from './gcode/clean';
-import { analyzeProgram, type ProgramInfo } from './gcode/analyze';
+import { analyzeProgram } from './gcode/analyze';
 import { maskFromRGBA, mirrorMask, type Mask } from './cam/mask';
 import { planCarve, COVERAGE, type CarveSettings } from './cam/carve';
 import { emitGcode, orderPaths, type Operation } from './cam/operation';
+import { placePaths, type Placement, type Rotation } from './cam/placement';
 import { planSurfacing } from './cam/surfacing';
 import { svgToPolylines } from './cam/svgLines';
-import { PreviewCanvas, bitmapLayer, cssVar, type ImageLayer } from './ui/preview';
+import { LocalLibrary, RemoteLibrary, type Library, type LoadedFile, type NewFile } from './files/library';
+import { PreviewCanvas, bitmapLayer, cssVar } from './ui/preview';
 
 // ───────────────────────── helpers ─────────────────────────
 
@@ -27,16 +29,21 @@ const fmt = (v: number) => v.toFixed(3);
 const minutes = (m: number) => (m < 1 ? `${Math.round(m * 60)} s` : m < 60 ? `${Math.round(m)} min` : `${Math.floor(m / 60)} h ${Math.round(m % 60)} min`);
 const MAX_PIXELS = 6_000_000;
 
+// ───────────────────────── controller ─────────────────────────
+
+// Served by the Pi server → drive the machine attached to the Pi; otherwise talk USB from this browser.
+const remote = (await detectRemote()) ? new RemoteMachine() : null;
+const local = remote ? null : new GrblController();
+const controller: MachineClient = remote ?? local!;
+const library: Library = remote ? new RemoteLibrary(remote) : new LocalLibrary();
+
 // ───────────────────────── persisted settings ─────────────────────────
 
+// Kept in this browser, and on the Pi too when there is one, so every device uses the same bits and feeds.
 const SETTINGS_KEY = 'studio3018.settings';
-function loadSettings() {
-  let saved: Record<string, string | boolean> = {};
-  try {
-    saved = JSON.parse(localStorage.getItem(SETTINGS_KEY) ?? '{}');
-  } catch {
-    /* storage unavailable */
-  }
+type Settings = Record<string, string | boolean>;
+
+function applySettings(saved: Settings) {
   document.querySelectorAll<HTMLInputElement | HTMLSelectElement>('[data-key]').forEach((el) => {
     const v = saved[el.dataset.key!];
     if (v === undefined) return;
@@ -44,28 +51,49 @@ function loadSettings() {
     else el.value = String(v);
   });
 }
-function saveSettings() {
-  const data: Record<string, string | boolean> = {};
+
+function collectSettings(): Settings {
+  const data: Settings = {};
   document.querySelectorAll<HTMLInputElement | HTMLSelectElement>('[data-key]').forEach((el) => {
     data[el.dataset.key!] = el instanceof HTMLInputElement && el.type === 'checkbox' ? el.checked : el.value;
   });
+  return data;
+}
+
+let pushTimer: ReturnType<typeof setTimeout> | undefined;
+function saveSettings() {
+  const data = collectSettings();
   try {
     localStorage.setItem(SETTINGS_KEY, JSON.stringify(data));
   } catch {
     /* storage unavailable */
   }
+  if (remote) {
+    clearTimeout(pushTimer);
+    pushTimer = setTimeout(() => remote.saveSettings(data).catch(() => undefined), 500);
+  }
 }
-loadSettings();
+
+try {
+  applySettings(JSON.parse(localStorage.getItem(SETTINGS_KEY) ?? '{}'));
+} catch {
+  /* storage unavailable */
+}
+if (remote) {
+  try {
+    const shared = await remote.settings();
+    if (Object.keys(shared).length) applySettings(shared);
+    else saveSettings(); // first device to connect: share its settings
+  } catch {
+    /* older Pi version without shared settings */
+  }
+}
 document.addEventListener('change', (e) => {
   if ((e.target as HTMLElement).dataset?.key) saveSettings();
 });
 
-// ───────────────────────── controller + log ─────────────────────────
+// ───────────────────────── log ─────────────────────────
 
-// Served by the Pi server → drive the machine attached to the Pi; otherwise talk USB from this browser.
-const remote = (await detectRemote()) ? new RemoteMachine() : null;
-const local = remote ? null : new GrblController();
-const controller: MachineClient = remote ?? local!;
 const logEl = $('log');
 function log(kind: LogKind, text: string) {
   const line = document.createElement('div');
@@ -130,6 +158,15 @@ $('btn-goto-zero').addEventListener('click', async () => {
   if (m.wpos[2] < 5) await send('G90 G0 Z5');
   await send('G90 G0 X0 Y0');
 });
+$('btn-spindle-on').addEventListener('click', () => send(`M3 S${num('spindle-s')}`));
+$('btn-reset').addEventListener('click', () => controller.softReset());
+
+document.querySelectorAll<HTMLButtonElement>('[data-jog]').forEach((b) =>
+  b.addEventListener('click', () => {
+    const distance = Number(value('jog-step')) * Number(b.dataset.dir);
+    send(`$J=G91 G21 ${b.dataset.jog}${distance} F${num('jog-feed')}`);
+  }),
+);
 
 // ───────────────────────── travel limits ─────────────────────────
 
@@ -162,50 +199,6 @@ $('btn-home').addEventListener('click', async () => {
     log('error', (e as Error).message);
   }
 });
-
-/** The program's moves checked against the limits from the current zero: null if no limits are set. */
-function limitCheck(lines: string[]): { ok: boolean; text: string } | null {
-  const m = controller.machine;
-  if (!m.limits) return null;
-  const moves = (active && active.lines === lines ? active.info : analyzeProgram(lines)).moves;
-  const violations = checkMoves(moves, m.wco, m.limits);
-  return violations.length
-    ? { ok: false, text: `From the current zero this job goes ${describeViolations(violations)}.` }
-    : { ok: true, text: 'Fits inside the travel limits from the current zero.' };
-}
-
-/** Starts a job, asking first if it goes past the limits. Returns false if it didn't start. */
-async function startChecked(name: string, lines: string[], options: StartOptions): Promise<boolean> {
-  const check = limitCheck(lines);
-  let ignoreLimits = false;
-  if (check && !check.ok) {
-    if (!confirm(`${check.text}\n\nMove the zero, or start anyway?\n(OK = start anyway)`)) return false;
-    ignoreLimits = true;
-  }
-  try {
-    await controller.startJob(name, lines, { ...options, ignoreLimits });
-    return true;
-  } catch (e) {
-    alert((e as Error).message);
-    return false;
-  }
-}
-
-$('btn-trace').addEventListener('click', async () => {
-  const b = active?.info.cutBounds;
-  if (!active || !b) return;
-  const lift = Math.max(controller.machine.wpos[2], num('safe-z'));
-  await startChecked(`Trace outline: ${active.name}`, traceOutline(b, lift), { kind: 'trace' });
-});
-$('btn-spindle-on').addEventListener('click', () => send(`M3 S${num('spindle-s')}`));
-$('btn-reset').addEventListener('click', () => controller.softReset());
-
-document.querySelectorAll<HTMLButtonElement>('[data-jog]').forEach((b) =>
-  b.addEventListener('click', () => {
-    const distance = Number(value('jog-step')) * Number(b.dataset.dir);
-    send(`$J=G91 G21 ${b.dataset.jog}${distance} F${num('jog-feed')}`);
-  }),
-);
 
 // ───────────────────────── console ─────────────────────────
 
@@ -254,30 +247,9 @@ updateLegend();
 
 // ───────────────────────── files ─────────────────────────
 
-interface JobFile {
-  id: number;
-  name: string;
-  text: string;
-  lines: string[];
-  info: ProgramInfo;
-  tool: string;
-  block: ImageLayer | null;
-  print: ImageLayer | null;
-}
+let active: LoadedFile | null = null;
 
-const files: JobFile[] = [];
-let active: JobFile | null = null;
-let nextId = 1;
-
-function addFile(name: string, text: string, tool: string, block: ImageLayer | null, print: ImageLayer | null): JobFile {
-  const lines = prepareProgram(text);
-  const file: JobFile = { id: nextId++, name, text, lines, info: analyzeProgram(lines), tool, block, print };
-  files.push(file);
-  return file;
-}
-
-function selectFile(file: JobFile | null) {
-  if (controller.jobActive) return;
+function setActive(file: LoadedFile | null) {
   active = file;
   preview.setProgram(file?.info ?? null, file?.block ?? null);
   if (file?.print) preview.setPrint(file.print);
@@ -285,7 +257,22 @@ function selectFile(file: JobFile | null) {
   renderRun();
 }
 
-function download(file: JobFile) {
+async function selectFile(id: string) {
+  if (controller.jobActive) return;
+  const file = await library.load(id);
+  if (file) setActive(file);
+  else log('error', 'That file is no longer available.');
+}
+
+async function addFile(file: NewFile): Promise<LoadedFile> {
+  const added = await library.add(file);
+  if (added.info.warnings.length) log('info', `${added.name}: ${added.info.warnings.join(' ')}`);
+  return added;
+}
+
+async function download(id: string) {
+  const file = await library.load(id);
+  if (!file) return;
   const url = URL.createObjectURL(new Blob([file.text], { type: 'text/plain' }));
   const a = document.createElement('a');
   a.href = url;
@@ -294,28 +281,25 @@ function download(file: JobFile) {
   setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
-function describe(file: JobFile): string {
-  const b = file.info.cutBounds;
-  const size = b ? `${(b.max[0] - Math.min(0, b.min[0])).toFixed(1)} × ${(b.max[1] - Math.min(0, b.min[1])).toFixed(1)} mm, ${(-b.min[2]).toFixed(2)} mm deep` : 'no cutting moves';
-  return `${size} · ~${minutes(file.info.estimatedMinutes)}`;
-}
-
 function renderFiles() {
   const list = $('files');
   list.innerHTML = '';
-  if (!files.length) {
+  const entries = library.list();
+  if (!entries.length) {
     list.innerHTML = '<li class="muted">Nothing yet.</li>';
     return;
   }
-  for (const file of files) {
+  const running = controller.jobActive;
+  for (const entry of entries) {
+    const isActive = entry.id === active?.id;
     const li = document.createElement('li');
-    li.className = 'file' + (file === active ? ' active' : '');
+    li.className = 'file' + (isActive ? ' active' : '');
     const name = document.createElement('div');
     name.className = 'file-name';
-    name.textContent = file.name;
+    name.textContent = entry.name;
     const meta = document.createElement('div');
     meta.className = 'file-meta';
-    meta.textContent = `${file.tool ? file.tool + ' · ' : ''}${describe(file)}`;
+    meta.textContent = `${entry.tool ? entry.tool + ' · ' : ''}${entry.summary}`;
     const row = document.createElement('div');
     row.className = 'row';
     const button = (label: string, fn: () => void, disabled = false) => {
@@ -325,17 +309,22 @@ function renderFiles() {
       b.addEventListener('click', fn);
       row.appendChild(b);
     };
-    button(file === active ? 'Selected' : 'Select', () => selectFile(file), file === active || controller.jobActive);
-    button('Download', () => download(file));
-    button('Remove', () => {
-      files.splice(files.indexOf(file), 1);
-      if (active === file) selectFile(null);
-      else renderFiles();
-    }, controller.jobActive && file === active);
+    button(isActive ? 'Selected' : 'Select', () => selectFile(entry.id), isActive || running);
+    button('Download', () => download(entry.id));
+    button('Remove', async () => {
+      if (remote && !confirm(`Remove "${entry.name}" from the Pi?`)) return;
+      await library.remove(entry.id).catch((e) => log('error', (e as Error).message));
+      if (active?.id === entry.id) setActive(null);
+    }, running && isActive);
     li.append(name, meta, row);
     list.appendChild(li);
   }
 }
+library.onChange(() => {
+  // Another device removed the file this one has open.
+  if (active && !library.list().some((f) => f.id === active!.id)) setActive(null);
+  else renderFiles();
+});
 
 // ───────────────────────── design panel ─────────────────────────
 
@@ -358,6 +347,8 @@ function message(text: string, kind: 'note' | 'error' | 'warn' = 'note') {
   el.className = `note ${kind === 'note' ? '' : kind}`;
   el.textContent = text;
 }
+
+const placement = (): Placement => ({ x: num('place-x'), y: num('place-y'), rotation: Number(value('place-rotation')) as Rotation });
 
 // Image source
 let image: { bitmap: ImageBitmap; name: string } | null = null;
@@ -430,25 +421,24 @@ $('gcode-file').addEventListener('change', async (e) => {
   const input = e.target as HTMLInputElement;
   const file = input.files?.[0];
   if (!file) return;
-  const job = addFile(file.name, await file.text(), '', null, null);
-  if (job.info.warnings.length) log('info', `${file.name}: ${job.info.warnings.join(' ')}`);
-  selectFile(job);
-  showView('toolpath');
+  try {
+    setActive(await addFile({ name: file.name, tool: '', text: await file.text() }));
+    showView('toolpath');
+  } catch (err) {
+    log('error', `Could not add ${file.name}: ${(err as Error).message}`);
+  }
   input.value = '';
 });
 
-function shared() {
-  return { safeZ: num('safe-z'), spindle: num('job-spindle') };
-}
-
 async function generate() {
   const type = value('job-type');
-  const { safeZ, spindle } = shared();
+  const safeZ = num('safe-z');
+  const spindle = num('job-spindle');
   message('Working…');
   await nextFrame();
   const started = performance.now();
   try {
-    let created: JobFile[] = [];
+    const created: LoadedFile[] = [];
     if (type === 'image') {
       const mask = rasterize(num('img-res'));
       const settings: CarveSettings = {
@@ -476,11 +466,15 @@ async function generate() {
       };
       const plan = planCarve(mask, settings);
       const colors = maskColors();
-      const block = bitmapLayer(plan.coverage, mask.width, mask.height, mask.res, colors);
+      const place = placement();
+      const width = mask.width * mask.res;
+      const height = mask.height * mask.res;
+      const block = { ...bitmapLayer(plan.coverage, mask.width, mask.height, mask.res, colors), ...place };
       const print = bitmapLayer(plan.coverage, mask.width, mask.height, mask.res, colors, checked('img-mirror'));
-      created = plan.operations.map((op, i) =>
-        addFile(`${image!.name} ${i + 1}-${op.name.toLowerCase()}.nc`, emitGcode(op), op.tool, block, print),
-      );
+      for (const [i, op] of plan.operations.entries()) {
+        const placed = { ...op, paths: placePaths(op.paths, width, height, place) };
+        created.push(await addFile({ name: `${image!.name} ${i + 1}-${op.name.toLowerCase()}.nc`, tool: op.tool, text: emitGcode(placed), block, print }));
+      }
       const total = created.reduce((m, f) => m + f.info.estimatedMinutes, 0);
       const missed = plan.missedArea > 0.5
         ? ` ${plan.missedArea.toFixed(1)} mm² is too narrow for the bits (red in the print preview) and will stay at surface level.`
@@ -492,8 +486,10 @@ async function generate() {
       preview.setPrint(print);
     } else if (type === 'svg') {
       if (!svg) throw new Error('Choose an SVG file first.');
-      const { lines } = svgToPolylines(svg.text, num('svg-width'), checked('svg-mirror'));
+      const width = num('svg-width');
+      const { lines, height } = svgToPolylines(svg.text, width, checked('svg-mirror'));
       const depth = num('svg-depth');
+      const paths = lines.map((l) => l.map(([x, y]) => [x, y, -depth] as [number, number, number]));
       const op: Operation = {
         name: `Engrave ${svg.name}`,
         tool: value('svg-tool'),
@@ -502,9 +498,9 @@ async function generate() {
         plungeFeed: num('svg-plunge'),
         stepdown: num('svg-stepdown'),
         safeZ,
-        paths: orderPaths(lines.map((l) => l.map(([x, y]) => [x, y, -depth] as [number, number, number]))),
+        paths: orderPaths(placePaths(paths, width, height, placement())),
       };
-      created = [addFile(`${svg.name}-engrave.nc`, emitGcode(op), op.tool, null, null)];
+      created.push(await addFile({ name: `${svg.name}-engrave.nc`, tool: op.tool, text: emitGcode(op) }));
       message(`Made 1 file (~${minutes(created[0].info.estimatedMinutes)}).`);
     } else if (type === 'surface') {
       const op = planSurfacing({
@@ -519,12 +515,12 @@ async function generate() {
         spindle,
         safeZ,
       });
-      created = [addFile(`surface-${num('s-width')}x${num('s-height')}.nc`, emitGcode(op), op.tool, null, null)];
+      created.push(await addFile({ name: `surface-${num('s-width')}x${num('s-height')}.nc`, tool: op.tool, text: emitGcode(op) }));
       message(`Made 1 file (~${minutes(created[0].info.estimatedMinutes)}).`);
     }
     log('info', `Generated ${created.length} file(s) in ${Math.round(performance.now() - started)} ms`);
-    if (created.length) {
-      selectFile(created[0]);
+    if (created.length && !controller.jobActive) {
+      setActive(created[0]);
       showView('toolpath');
     }
   } catch (e) {
@@ -535,44 +531,123 @@ $('btn-generate').addEventListener('click', generate);
 
 // ───────────────────────── run bar ─────────────────────────
 
-$('btn-start').addEventListener('click', async () => {
-  if (!active) return;
+/** The program's moves checked against the limits from the current zero: null if no limits are set. */
+function limitCheck(lines: string[]): { ok: boolean; text: string } | null {
+  const m = controller.machine;
+  if (!m.limits) return null;
+  const info = active && active.lines === lines ? active.info : analyzeProgram(lines);
+  const violations = checkMoves(info.moves, m.wco, m.limits);
+  const unchecked = info.unchecked ? ' It also uses machine-coordinate moves (G28/G53 …), which can\'t be checked.' : '';
+  return violations.length
+    ? { ok: false, text: `From the current zero this job goes ${describeViolations(violations)}.${unchecked}` }
+    : { ok: !unchecked, text: unchecked ? `Mostly checked against the travel limits.${unchecked}` : 'Fits inside the travel limits from the current zero.' };
+}
+
+const axisList = (axes: string) => [...axes].join(', ').replace(/, (\w)$/, ' and $1');
+
+/** Starts a job, asking first if it goes past the limits. Returns false if it didn't start. */
+async function startChecked(name: string, lines: string[], options: StartOptions): Promise<boolean> {
+  const check = limitCheck(lines);
+  let ignoreLimits = false;
+  if (check && !check.ok && /goes/.test(check.text)) {
+    if (!confirm(`${check.text}\n\nMove the zero, or start anyway?\n(OK = start anyway)`)) return false;
+    ignoreLimits = true;
+  }
+  try {
+    await controller.startJob(name, lines, { ...options, ignoreLimits });
+    return true;
+  } catch (e) {
+    alert((e as Error).message);
+    return false;
+  }
+}
+
+/** The questions to ask before cutting. Returns false if the user backs out. */
+function confirmStart(title: string): boolean {
+  const file = active!;
   const m = controller.machine;
   if (m.state.startsWith('Alarm')) {
     alert('The controller is in an alarm state. Press Unlock first (and check your zero).');
-    return;
+    return false;
   }
-  const b = active.info.cutBounds;
+  const b = file.info.cutBounds;
   const checklist = [
-    `Run "${active.name}"?`,
+    ...(m.zeroUnverified ? [`⚠ The controller restarted since the zero was set, so the ${axisList(m.zeroUnverified)} zero may have moved. Set it again first unless you're sure.`, ''] : []),
+    title,
     '',
-    active.tool ? `• The ${active.tool} is in the spindle` : '• The right bit is in the spindle',
+    file.tool ? `• The ${file.tool} is in the spindle` : '• The right bit is in the spindle',
     '• X0 Y0 is set at the bottom-left of the design',
     '• Z0 is set on the top of the material',
     '• The material is held down firmly',
     b ? `\nIt cuts ${(b.max[0] - b.min[0]).toFixed(1)} × ${(b.max[1] - b.min[1]).toFixed(1)} mm, down to Z${fmt(b.min[2])}.` : '',
     m.limits ? '' : '\nTravel limits aren\'t set, so nothing checks that it fits. "Trace outline" shows where it will go.',
   ];
-  if (!confirm(checklist.join('\n'))) return;
-  await startChecked(active.name, active.lines, { kind: 'job' });
+  return confirm(checklist.join('\n'));
+}
+
+$('btn-start').addEventListener('click', async () => {
+  if (!active || !confirmStart(`Run "${active.name}"?`)) return;
+  await startChecked(active.name, active.lines, { kind: 'job', source: active.id });
 });
+
+$('btn-start-from').addEventListener('click', async () => {
+  if (!active) return;
+  const file = active;
+  const job = controller.job;
+  // After a stopped job, suggest a little before where it got to: the last few acknowledged
+  // lines were only planned, and re-cutting a few millimetres does no harm.
+  const reached = job && job.kind === 'job' && job.source === file.id && job.status !== 'finished' ? job.acked + (job.lineOffset ?? 0) : null;
+  const suggested = reached !== null ? Math.max(1, reached - 20) : 1;
+  const answer = prompt(
+    `Start "${file.name}" from which line? (1–${file.lines.length})` + (reached !== null ? `\nThe last run got to about line ${reached}.` : ''),
+    String(suggested),
+  );
+  if (answer === null) return;
+  const line = Math.round(Number(answer));
+  if (!(line >= 1 && line <= file.lines.length)) {
+    alert(`Enter a line number from 1 to ${file.lines.length}.`);
+    return;
+  }
+  let plan;
+  try {
+    plan = resumeFrom(file.lines, line - 1, num('safe-z'));
+  } catch (e) {
+    alert((e as Error).message);
+    return;
+  }
+  if (!confirmStart(`Run "${file.name}" from line ${line}?\nThe bit lifts, moves to where that line starts and plunges there.`)) return;
+  await startChecked(`${file.name} (from line ${line})`, plan.lines, { kind: 'job', source: file.id, lineOffset: line - 1 - plan.preamble });
+});
+
+$('btn-trace').addEventListener('click', async () => {
+  const b = active?.info.cutBounds;
+  if (!active || !b) return;
+  const lift = Math.max(controller.machine.wpos[2], num('safe-z'));
+  await startChecked(`Trace outline: ${active.name}`, traceOutline(b, lift), { kind: 'trace', source: active.id });
+});
+
 $('btn-pause').addEventListener('click', () => controller.pauseJob());
+document.querySelectorAll<HTMLButtonElement>('[data-ov]').forEach((b) =>
+  b.addEventListener('click', () => controller.realtime(OVERRIDES[b.dataset.ov as keyof typeof OVERRIDES])),
+);
 $('btn-resume').addEventListener('click', () => controller.resumeJob());
 $('btn-stop').addEventListener('click', () => controller.stopJob());
 
-const isJobFile = (job: JobView | null, file: JobFile | null) => !!job && !!file && job.name === file.name && job.total === file.lines.length;
+const isFromActive = (job: JobView | null) => !!job && !!active && job.source === active.id;
 
 function renderRun() {
   const job = controller.job;
   const running = controller.jobActive;
-  const showingJob = job && (running || isJobFile(job, active) || (job.kind === 'trace' && job.name === `Trace outline: ${active?.name}`));
+  const showingJob = job && (running || isFromActive(job));
   $('run-name').textContent = showingJob ? job!.name : active?.name ?? 'No file loaded';
-  $('run-stats').textContent = active ? describe(active) : '';
+  $('run-stats').textContent = active?.summary ?? '';
   const fraction = showingJob && job!.total ? job!.acked / job!.total : 0;
   $('run-progress').style.width = `${(fraction * 100).toFixed(1)}%`;
-  $<HTMLButtonElement>('btn-start').disabled = !active || !controller.connected || running;
-  $<HTMLButtonElement>('btn-trace').disabled = !active?.info.cutBounds || !controller.connected || running;
-  const check = active && !running && controller.connected ? limitCheck(active.lines) : null;
+  const ready = !!active && controller.connected && !running;
+  $<HTMLButtonElement>('btn-start').disabled = !ready;
+  $<HTMLButtonElement>('btn-start-from').disabled = !ready;
+  $<HTMLButtonElement>('btn-trace').disabled = !ready || !active?.info.cutBounds;
+  const check = ready ? limitCheck(active!.lines) : null;
   const limitsNote = $('run-limits');
   limitsNote.hidden = !check;
   limitsNote.textContent = check?.text ?? '';
@@ -580,6 +655,11 @@ function renderRun() {
   $<HTMLButtonElement>('btn-pause').disabled = job?.status !== 'running';
   $<HTMLButtonElement>('btn-resume').disabled = job?.status !== 'paused';
   $<HTMLButtonElement>('btn-stop').disabled = !running;
+  // Overrides act on the running job (and on manual moves), so show them while connected.
+  const [feedOv, , spindleOv] = controller.machine.overrides;
+  $('overrides').hidden = !controller.connected;
+  $('ov-feed').textContent = `${feedOv}%`;
+  $('ov-spindle').textContent = `${spindleOv}%`;
 
   let time = '';
   if (showingJob) {
@@ -594,7 +674,7 @@ function renderRun() {
   msg.hidden = !(showingJob && job!.message);
   msg.textContent = job?.message ?? '';
   msg.className = `note ${job?.status === 'finished' ? '' : 'error'}`;
-  preview.setProgress(isJobFile(job, active) ? job!.acked : -1);
+  preview.setProgress(job && job.kind === 'job' && isFromActive(job) ? job.acked + (job.lineOffset ?? 0) : -1);
 }
 
 function renderMachine() {
@@ -613,6 +693,9 @@ function renderMachine() {
     $(`w${axis}`).textContent = fmt(m.wpos[i]);
     $(`m${axis}`).textContent = fmt(m.mpos[i]);
   });
+  const zeroWarning = $('zero-warning');
+  zeroWarning.hidden = !connected || !m.zeroUnverified;
+  zeroWarning.textContent = `The controller restarted, so the ${axisList(m.zeroUnverified)} zero may no longer match the material. Set ${m.zeroUnverified.length > 1 ? 'them' : 'it'} again before cutting.`;
   // No jogging or zeroing while a job is streaming.
   const locked = controller.jobActive;
   document.querySelectorAll<HTMLButtonElement>('#machine-panel .needs-connection button:not(#btn-reset)').forEach((b) => (b.disabled = locked));
@@ -635,33 +718,17 @@ function renderMachine() {
   if (remote) void followRemoteJob();
 }
 
-/** When a job was started from another device, fetch its G-code so this one can show the preview too. */
-let fetchingProgram = false;
+/** When a job was started from another device, open its file here too so the preview follows it. */
+let following = false;
 async function followRemoteJob() {
   const job = controller.job;
-  if (!remote || !job || job.kind === 'trace' || !controller.jobActive || fetchingProgram) return;
-  const existing = files.find((f) => isJobFile(job, f));
-  if (existing) {
-    if (active !== existing) {
-      active = existing;
-      preview.setProgram(existing.info, existing.block);
-      renderFiles();
-      renderRun();
-    }
-    return;
-  }
-  fetchingProgram = true;
+  if (!job?.source || !controller.jobActive || following || active?.id === job.source) return;
+  following = true;
   try {
-    const program = await remote.program();
-    const file = addFile(program.name, program.text, '', null, null);
-    active = file;
-    preview.setProgram(file.info, null);
-    renderFiles();
-    renderRun();
-  } catch {
-    /* try again on the next update */
+    const file = await library.load(job.source);
+    if (file) setActive(file);
   } finally {
-    fetchingProgram = false;
+    following = false;
   }
 }
 
@@ -719,22 +786,33 @@ if (remote) {
   $('btn-pi-update').addEventListener('click', async () => {
     if (updating || !confirm('Install the update on the Pi?\n\nIt takes a few minutes (longer if new build tools are needed). The machine is disconnected and this page reloads when it is done.')) return;
     try {
-      await remote.update();
+      const requestedAt = await remote.update();
       updating = true;
       $('btn-pi-update').hidden = true;
       note('pi-update-info', 'Updating… this page reloads by itself when the Pi is back.');
-      // The Pi restarts the server at the end; keep checking for the new version.
+      // The Pi restarts the server at the end; keep checking for the new version, or a failure.
       const poll = setInterval(async () => {
         try {
           const info = await remote.systemInfo();
+          const last = info.lastUpdate;
           if (info.version && info.version.commit !== commit) {
             clearInterval(poll);
             location.reload();
+          } else if (last && last.time >= requestedAt - 1000 && last.state !== 'running') {
+            clearInterval(poll);
+            updating = false;
+            if (last.state === 'failed') {
+              note('pi-update-info', `The update failed while ${last.step}. The previous version is still running. Details on the Pi: journalctl -u 3018-studio-update -n 50`, 'error');
+            } else {
+              note('pi-update-info', 'Already up to date.');
+            }
+          } else if (last?.state === 'running') {
+            note('pi-update-info', `Updating (${last.step})… this page reloads by itself when the Pi is back.`);
           }
         } catch {
           /* still restarting */
         }
-      }, 5000);
+      }, 3000);
     } catch (e) {
       note('pi-update-info', (e as Error).message, 'error');
     }
@@ -774,5 +852,6 @@ controller.onChange(() => {
   });
 });
 setInterval(() => controller.jobActive && renderRun(), 1000);
+renderFiles();
 renderMachine();
 renderRun();

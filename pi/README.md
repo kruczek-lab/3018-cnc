@@ -72,6 +72,8 @@ automatically whenever the Pi powers on. It ends by printing the address, e.g.
 3. The top bar says **Pi · …**. Press **Connect machine** (it connects by itself if the
    machine was on when the Pi started).
 4. Everything else works as in the main README: create a job, set zero, **Start**.
+   Files you make or open are stored on the Pi, so they're there on every device and after the
+   browser is closed; settings such as bit sizes and feeds are shared the same way.
 5. Once a job is running you can close the page. Open the address on your phone to watch,
    pause or stop it. Tip: in Safari use *Share → Add to Home Screen* for a one-tap icon.
 
@@ -173,6 +175,7 @@ sudo rm -f /etc/sudoers.d/3018-studio
 sudo systemctl daemon-reload
 rm -rf ~/studio
 ```
-Use your app folder's name in the last line if it isn't `studio`. Your settings and password
-stay in `/etc/default/3018-studio`, ready for a reinstall; to remove those too:
-`sudo rm -f /etc/default/3018-studio`.
+Use your app folder's name in the last line if it isn't `studio`. Your password and port stay
+in `/etc/default/3018-studio`, and your saved files and shared settings in
+`~/.local/share/3018-studio`, ready for a reinstall. To remove those too:
+`sudo rm -f /etc/default/3018-studio` and `rm -rf ~/.local/share/3018-studio`.

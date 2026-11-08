@@ -17,10 +17,12 @@ export interface Operation {
   notes?: string[];
 }
 
-const n = (v: number) => {
+/** Formats a coordinate for G-code: at most 3 decimals, no trailing zeros, never "-0". */
+export function formatNumber(v: number): string {
   const s = v.toFixed(3).replace(/\.?0+$/, '');
   return s === '-0' ? '0' : s;
-};
+}
+const n = formatNumber;
 
 const samePoint = (a: Point3, b: Point3) => Math.abs(a[0] - b[0]) < 1e-6 && Math.abs(a[1] - b[1]) < 1e-6;
 
@@ -48,7 +50,8 @@ export function emitGcode(op: Operation): string {
 
   for (const path of op.paths) {
     if (!path.length) continue;
-    const deepest = Math.min(...path.map((p) => p[2]));
+    let deepest = 0;
+    for (const p of path) deepest = Math.min(deepest, p[2]);
     const passes = Math.max(1, Math.ceil(-deepest / op.stepdown - 1e-9));
     const closed = path.length > 2 && samePoint(path[0], path[path.length - 1]);
     for (let pass = 1; pass <= passes; pass++) {

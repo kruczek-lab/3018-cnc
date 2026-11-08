@@ -21,7 +21,24 @@ export interface MachineState {
   limits: TravelLimits | null;
   /** GRBL's homing cycle is enabled ($22=1), i.e. limit switches are fitted. */
   homingEnabled: boolean;
+  /** Feed, rapid and spindle overrides in percent. */
+  overrides: Vec3;
+  /**
+   * Axes whose work zero may no longer match the material, e.g. 'XYZ'. GRBL forgets its
+   * position when the board restarts but keeps the saved work offset, so the zero can move.
+   */
+  zeroUnverified: string;
 }
+
+/** GRBL real-time override commands. */
+export const OVERRIDES = {
+  feedReset: 0x90,
+  feedPlus: 0x91,
+  feedMinus: 0x92,
+  spindleReset: 0x99,
+  spindlePlus: 0x9a,
+  spindleMinus: 0x9b,
+} as const;
 
 export type JobStatus = 'running' | 'paused' | 'finished' | 'stopped' | 'error';
 
@@ -30,6 +47,10 @@ export interface JobView {
   name: string;
   /** A real job, or the trace-outline dry run. */
   kind: 'job' | 'trace';
+  /** Id of the file the job came from, if any. */
+  source?: string;
+  /** Line index in the source file that job line 0 corresponds to (for jobs started part-way). */
+  lineOffset?: number;
   /** Number of lines in the job. */
   total: number;
   sent: number;
@@ -58,6 +79,8 @@ interface Command {
 
 export interface StartOptions {
   kind?: 'job' | 'trace';
+  source?: string;
+  lineOffset?: number;
   /** Start even though the job goes past the travel limits. */
   ignoreLimits?: boolean;
 }
@@ -77,6 +100,8 @@ const disconnected = (): MachineState => ({
   version: '',
   limits: null,
   homingEnabled: false,
+  overrides: [100, 100, 100],
+  zeroUnverified: '',
 });
 
 /**
@@ -154,7 +179,13 @@ export class GrblController {
     let line = cleanLine(raw);
     if (!line) return Promise.resolve('ok');
     if (!this.transport) return Promise.reject(new Error('Not connected'));
-    if (line.startsWith('$J=') && this.machine.limits) {
+    if (this.jobActive) {
+      // Anything sent now would be slipped in between the job's lines.
+      this.log('error', `Not sent while a job is running: ${line}`);
+      return Promise.resolve('error:busy');
+    }
+    const isJog = line.startsWith('$J=');
+    if (isJog && this.machine.limits) {
       const limited = this.limitJog(line);
       if (!limited) {
         this.log('error', 'Not jogging: that axis is at its travel limit.');
@@ -163,12 +194,19 @@ export class GrblController {
       line = limited;
     }
     const changesSetting = /^\$\d+=/.test(line);
+    const zeroedAxes = setsWorkZero(line);
     return new Promise<string>((resolve) => {
       this.pending.push({ line, job: false, quiet: options.quiet, resolve });
       if (!options.quiet) this.log('tx', line);
       this.pump();
     }).then((response) => {
       if (changesSetting && response === 'ok') void this.readSettings();
+      // A rejected jog never reaches its target; plan the next one from where the machine is.
+      if (isJog && response !== 'ok') this.jogTarget = null;
+      if (zeroedAxes && response === 'ok') {
+        this.machine.zeroUnverified = [...this.machine.zeroUnverified].filter((a) => !zeroedAxes.includes(a)).join('');
+        this.emit();
+      }
       return response;
     });
   }
@@ -176,6 +214,7 @@ export class GrblController {
   /** Re-reads GRBL's `$$` settings (homing enabled, max travel …). */
   async readSettings(): Promise<void> {
     this.settingsRequested = true;
+    if (this.jobActive) return;
     await this.send('$$', { quiet: true });
     this.machine.homingEnabled = this.settings[22] === 1;
     this.emit();
@@ -260,6 +299,7 @@ export class GrblController {
 
   jogCancel(): void {
     this.realtime(0x85);
+    this.jogTarget = null;
   }
 
   softReset(): void {
@@ -279,7 +319,7 @@ export class GrblController {
       const violations = checkMoves(analyzeProgram(lines).moves, this.machine.wco, limits);
       if (violations.length) throw new LimitError(`From the current zero this job goes ${describeViolations(violations)}.`);
     }
-    this.job = { name, kind: options.kind ?? 'job', lines, total: lines.length, sent: 0, acked: 0, status: 'running', startedAt: Date.now(), pausedMs: 0 };
+    this.job = { name, kind: options.kind ?? 'job', source: options.source, lineOffset: options.lineOffset, lines, total: lines.length, sent: 0, acked: 0, status: 'running', startedAt: Date.now(), pausedMs: 0 };
     this.log('info', `Job started: ${name} (${lines.length} lines)`);
     this.pump();
     this.emit();
@@ -374,8 +414,12 @@ export class GrblController {
       this.machine.version = line;
       this.clearQueues();
       if (this.jobActive) this.finishJob('stopped', 'Controller was reset');
-      if (!this.expectReset) this.forgetLimits('the controller restarted');
+      if (!this.expectReset) {
+        this.forgetLimits('the controller restarted');
+        this.machine.zeroUnverified = 'XYZ';
+      }
       this.expectReset = false;
+      this.machine.overrides = [100, 100, 100];
       this.jogTarget = null;
       this.log('info', line);
       void this.readSettings();
@@ -422,6 +466,7 @@ export class GrblController {
     }
     if (status.feed !== undefined) m.feed = status.feed;
     if (status.spindle !== undefined) m.spindle = status.spindle;
+    if (status.overrides) m.overrides = status.overrides;
     if (status.state === 'Idle') this.jogTarget = null;
     // Some boards don't restart (and greet) when the port opens; read the settings anyway.
     if (!this.settingsRequested) void this.readSettings();
@@ -454,4 +499,11 @@ export class GrblController {
   private emit(): void {
     for (const fn of this.changeListeners) fn();
   }
+}
+
+/** The axes a `G10 L20`/`G10 L2` line sets the work zero of (e.g. 'XY'), or null for other lines. */
+function setsWorkZero(line: string): string | null {
+  const words = parseWords(line);
+  if (!words || !words.some(([l, v]) => l === 'G' && v === 10) || !words.some(([l, v]) => l === 'L' && (v === 20 || v === 2))) return null;
+  return words.filter(([l]) => l === 'X' || l === 'Y' || l === 'Z').map(([l]) => l).join('');
 }

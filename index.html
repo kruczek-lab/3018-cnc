@@ -38,6 +38,7 @@
               <tr><th>Z</th><td id="wz">0.000</td><td id="mz">0.000</td></tr>
             </tbody>
           </table>
+          <p id="zero-warning" class="note error" hidden></p>
           <div class="grid3">
             <button data-cmd="G10 L20 P1 X0">Zero X</button>
             <button data-cmd="G10 L20 P1 Y0">Zero Y</button>
@@ -149,9 +150,20 @@
           </div>
           <div class="progress"><div id="run-progress"></div></div>
           <p id="run-limits" class="note" hidden></p>
+          <div class="row overrides" id="overrides" hidden>
+            <span>Feed <strong id="ov-feed">100%</strong></span>
+            <button data-ov="feedMinus" title="Slow the cut down by 10%">−10%</button>
+            <button data-ov="feedPlus" title="Speed the cut up by 10%">+10%</button>
+            <button data-ov="feedReset">100%</button>
+            <span class="ov-gap">Spindle <strong id="ov-spindle">100%</strong></span>
+            <button data-ov="spindleMinus">−10%</button>
+            <button data-ov="spindlePlus">+10%</button>
+            <button data-ov="spindleReset">100%</button>
+          </div>
           <div class="row">
             <button id="btn-trace" disabled title="Move round the edge of the job with the bit raised and the spindle off">Trace outline</button>
             <button id="btn-start" class="primary" disabled>Start</button>
+            <button id="btn-start-from" disabled title="Start part-way through, e.g. after a job was stopped">Start from…</button>
             <button id="btn-pause" disabled>Pause</button>
             <button id="btn-resume" disabled>Resume</button>
             <button id="btn-stop" class="danger" disabled>Stop</button>
@@ -246,6 +258,23 @@
         <section data-job="gcode" hidden>
           <label class="block">G-code file <input id="gcode-file" type="file" accept=".nc,.gcode,.gc,.ngc,.tap,.txt" /></label>
           <p class="note">From any CAM program (Inkscape, Estlcam, Kiri:Moto, Carbide Create …). It's shown in the preview, then you can run it.</p>
+        </section>
+
+        <section data-job="image svg">
+          <h3>Placement</h3>
+          <div class="field-grid">
+            <label>X offset (mm) <input id="place-x" data-key="placeX" type="number" value="0" min="-300" max="300" step="1" /></label>
+            <label>Y offset (mm) <input id="place-y" data-key="placeY" type="number" value="0" min="-180" max="180" step="1" /></label>
+            <label>Rotate
+              <select id="place-rotation" data-key="placeRotation">
+                <option value="0">0°</option>
+                <option value="90">90° anticlockwise</option>
+                <option value="180">180°</option>
+                <option value="270">90° clockwise</option>
+              </select>
+            </label>
+          </div>
+          <p class="note">The design's bottom-left corner goes this far from X0 Y0.</p>
         </section>
 
         <section data-job="image svg surface" class="shared-fields">

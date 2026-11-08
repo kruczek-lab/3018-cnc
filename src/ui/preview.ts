@@ -1,11 +1,18 @@
 import type { Move, ProgramInfo } from '../gcode/analyze';
 import type { Vec3 } from '../machine/status';
 
-/** A bitmap placed on the bed, e.g. what the carved block will look like. Sizes in mm, bottom-left at X0 Y0. */
+/**
+ * A bitmap placed on the bed, e.g. what the carved block will look like. Sizes in mm. The
+ * image is rotated by `rotation` degrees (anticlockwise, about its bottom-left corner) and then
+ * moved so its bottom-left corner sits at (x, y), matching how the design was placed.
+ */
 export interface ImageLayer {
   canvas: HTMLCanvasElement;
   width: number;
   height: number;
+  x?: number;
+  y?: number;
+  rotation?: number;
 }
 
 interface Chunk {
@@ -124,7 +131,10 @@ export class PreviewCanvas {
     } else {
       const b = this.info?.cutBounds;
       if (b) include(Math.min(0, b.min[0]), Math.min(0, b.min[1]), b.max[0], b.max[1], true);
-      if (this.block) include(0, 0, this.block.width, this.block.height, !b);
+      if (this.block) {
+        const { x, y, w, h } = placedSize(this.block);
+        include(x, y, x + w, y + h, !b);
+      }
     }
     const { width, height } = this.canvas.getBoundingClientRect();
     const pad = 28;
@@ -165,7 +175,8 @@ export class PreviewCanvas {
     toDevice();
 
     if (this.mode === 'print') {
-      if (this.print) this.drawLayer(this.print);
+      // The print is shown as printed, without the placement on the bed.
+      if (this.print) this.drawLayer({ ...this.print, x: 0, y: 0, rotation: 0 });
       return;
     }
 
@@ -241,6 +252,11 @@ export class PreviewCanvas {
     const { ctx } = this;
     ctx.save();
     ctx.imageSmoothingEnabled = false;
+    const placed = placedSize(layer);
+    const r = ((layer.rotation ?? 0) * Math.PI) / 180;
+    // Undo the shift that rotating about the corner causes, then rotate the image into place.
+    ctx.translate(placed.x - placed.rx, placed.y - placed.ry);
+    ctx.rotate(r);
     // Images are stored top row first; flip back so they sit upright in Y-up space.
     ctx.translate(0, layer.height);
     ctx.scale(1, -1);
@@ -304,6 +320,19 @@ export class PreviewCanvas {
     c.addEventListener('pointercancel', end);
     c.addEventListener('dblclick', () => this.fit());
   }
+}
+
+/** Where a placed layer ends up: its bounding box, plus the offset rotation adds before moving it. */
+function placedSize(layer: ImageLayer): { x: number; y: number; w: number; h: number; rx: number; ry: number } {
+  const r = ((layer.rotation ?? 0) * Math.PI) / 180;
+  const c = Math.cos(r);
+  const s = Math.sin(r);
+  const corners = [[0, 0], [layer.width, 0], [0, layer.height], [layer.width, layer.height]].map(([x, y]) => [x * c - y * s, x * s + y * c]);
+  const rx = Math.min(...corners.map((p) => p[0]));
+  const ry = Math.min(...corners.map((p) => p[1]));
+  const w = Math.max(...corners.map((p) => p[0])) - rx;
+  const h = Math.max(...corners.map((p) => p[1])) - ry;
+  return { x: layer.x ?? 0, y: layer.y ?? 0, w, h, rx, ry };
 }
 
 function bucket(m: Move, deepest: number): number {

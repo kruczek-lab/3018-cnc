@@ -42,6 +42,23 @@ no machine attached.
 the machine to stop, then resets the controller, so the position isn't lost. **Reset controller**
 stops everything immediately.
 
+**While it cuts:** the **Feed** and **Spindle** buttons in the run bar speed the job up or slow it
+down in 10% steps, instantly, without regenerating the file: handy for finding the right speed
+for a new material. Commands can't be sent while a job runs (they would land in the middle of it).
+
+**Picking a job up part-way:** **Start from…** asks for a line number and, after a stopped job,
+suggests one a little before where it got to. The bit lifts, starts the spindle, moves to where
+that line begins and plunges there. If the controller lost its position in between (a red
+"zero may have moved" note), set the zero again exactly first.
+
+**"The zero may have moved":** when the controller restarts (reconnecting, a USB glitch, the Pi
+server restarting) it forgets where the machine is but keeps the saved zero, so the zero can end
+up in the wrong place. The app shows a red note under the position display, and Start warns too,
+until you set X/Y and Z zero again.
+
+**Placing a design:** for image and SVG jobs, *Placement* moves the design's bottom-left corner
+away from X0 Y0 and can turn it in quarter turns, e.g. to fit a tall design on a wide block.
+
 ## Travel limits
 
 Without limit switches the machine doesn't know where the ends of its axes are; driving past
@@ -119,11 +136,15 @@ what has been cut, so redundant passes are skipped and anything left is shown in
 
 ```sh
 npm install
-npm run dev      # http://localhost:5173
-npm test         # unit tests (planner, G-code, GRBL streaming, simulator, Pi server)
-npm run build    # typecheck, static site in dist/, Pi server in dist-server/
-npm start        # run the Pi server locally: http://localhost:8018
+npm run dev       # http://localhost:5173
+npm test          # unit tests (planner, G-code, GRBL streaming, simulator, Pi server)
+npm run test:e2e  # browser tests: builds, then drives the app in Chromium in both USB and Pi mode
+npm run build     # typecheck, static site in dist/, Pi server in dist-server/
+npm start         # run the Pi server locally: http://localhost:8018
 ```
+
+The serial-port tests need `socat` (virtual serial cables); they're skipped without it. The
+browser tests need Playwright's Chromium (`npx playwright install chromium`). Both run in CI.
 
 Code layout:
 
@@ -135,12 +156,14 @@ Code layout:
 - `src/cam/`: design → toolpaths. `carve.ts` (image carving), `svgLines.ts`, `surfacing.ts`, and
   `operation.ts` which writes G-code. New job types go here; they only need to produce an
   `Operation`.
+- `src/files/library.ts`: the file list, kept in the browser (USB mode) or on the Pi.
 - `src/ui/preview.ts`, `src/main.ts`: the interface. `src/machine/client.ts` is what the interface
   needs from a machine; `src/remote/remoteMachine.ts` provides it over the network.
 - `server/`: the Raspberry Pi server. It runs the same `GrblController` next to the machine
   (`linuxSerial.ts` opens the USB port with `stty`, no native modules) and serves the app plus a
-  small JSON API and a Server-Sent Events stream of state and log. `pi/install.sh` installs it
-  as a systemd service.
+  small JSON API and a Server-Sent Events stream of state and log. `files.ts` keeps G-code files
+  and shared settings in `~/.local/share/3018-studio`. `pi/install.sh` installs it as a systemd
+  service.
 
 ### Hosting
 

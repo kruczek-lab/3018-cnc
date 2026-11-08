@@ -8,6 +8,8 @@ interface SimMove {
   durationMs: number;
   elapsedMs: number;
   jog: boolean;
+  /** Feed moves follow the feed override; rapids and dwells don't. */
+  feedMove?: boolean;
 }
 
 const DEFAULT_SETTINGS: Record<number, number> = {
@@ -44,6 +46,9 @@ export class SimulatedGrbl implements Transport {
   private spindleOn = false;
   private hold = false;
   private alarm = false;
+  /** Feed and spindle override in percent (GRBL allows 10–200). */
+  private feedOverride = 100;
+  private spindleOverride = 100;
   private settings: Record<number, number> = { ...DEFAULT_SETTINGS };
   private moves: SimMove[] = [];
   private rx: string[] = [];
@@ -93,8 +98,16 @@ export class SimulatedGrbl implements Transport {
         this.absolute = true;
         this.motion = 0;
         this.spindleOn = false;
+        this.feedOverride = 100;
+        this.spindleOverride = 100;
         this.greet();
         break;
+      case 0x90: this.feedOverride = 100; break;
+      case 0x91: this.feedOverride = Math.min(200, this.feedOverride + 10); break;
+      case 0x92: this.feedOverride = Math.max(10, this.feedOverride - 10); break;
+      case 0x99: this.spindleOverride = 100; break;
+      case 0x9a: this.spindleOverride = Math.min(200, this.spindleOverride + 10); break;
+      case 0x9b: this.spindleOverride = Math.max(10, this.spindleOverride - 10); break;
       case 0x85: // jog cancel
         this.moves = this.moves.filter((m) => !m.jog);
         this.planned = this.moves.length ? [...this.moves[this.moves.length - 1].to] : [...this.mpos];
@@ -114,8 +127,8 @@ export class SimulatedGrbl implements Transport {
   }
 
   private statusLine(): string {
-    const s = this.spindleOn ? this.spindleSpeed : 0;
-    return `<${this.state()}|MPos:${this.mpos.map(fmt).join(',')}|FS:${Math.round(this.feed)},${s}|WCO:${this.wco.map(fmt).join(',')}>`;
+    const s = this.spindleOn ? Math.round((this.spindleSpeed * this.spindleOverride) / 100) : 0;
+    return `<${this.state()}|MPos:${this.mpos.map(fmt).join(',')}|FS:${Math.round(this.feed)},${s}|WCO:${this.wco.map(fmt).join(',')}|Ov:${this.feedOverride},100,${this.spindleOverride}>`;
   }
 
   private tick(dtMs: number): void {
@@ -123,9 +136,10 @@ export class SimulatedGrbl implements Transport {
     let budget = this.hold ? 0 : dtMs * this.speedup;
     while (budget > 0 && this.moves.length) {
       const m = this.moves[0];
-      const used = Math.min(m.durationMs - m.elapsedMs, budget);
+      const rate = m.feedMove ? this.feedOverride / 100 : 1;
+      const used = Math.min(m.durationMs - m.elapsedMs, budget * rate);
       m.elapsedMs += used;
-      budget -= used;
+      budget -= used / rate;
       const t = m.durationMs > 0 ? m.elapsedMs / m.durationMs : 1;
       this.mpos = [0, 1, 2].map((i) => m.from[i] + (m.to[i] - m.from[i]) * t) as Vec3;
       if (m.elapsedMs >= m.durationMs) this.moves.shift();
@@ -139,10 +153,10 @@ export class SimulatedGrbl implements Transport {
     }
   }
 
-  private queueMove(to: Vec3, rate: number, jog: boolean): void {
+  private queueMove(to: Vec3, rate: number, jog: boolean, feedMove = false): void {
     const from = this.planned;
     const length = Math.hypot(to[0] - from[0], to[1] - from[1], to[2] - from[2]);
-    this.moves.push({ from, to, durationMs: (length / rate) * 60000, elapsedMs: 0, jog });
+    this.moves.push({ from, to, durationMs: (length / rate) * 60000, elapsedMs: 0, jog, feedMove });
     this.planned = to;
   }
 
@@ -228,7 +242,7 @@ export class SimulatedGrbl implements Transport {
         this.alarm = true;
         return ['ALARM:2', 'ok'];
       }
-      this.queueMove(to, this.motion === 0 ? SimulatedGrbl.MAX_RATE : Math.min(this.feed, SimulatedGrbl.MAX_RATE), false);
+      this.queueMove(to, this.motion === 0 ? SimulatedGrbl.MAX_RATE : Math.min(this.feed, SimulatedGrbl.MAX_RATE), false, this.motion !== 0);
     }
     return ['ok'];
   }

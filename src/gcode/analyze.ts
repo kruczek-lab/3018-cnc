@@ -22,6 +22,8 @@ export interface ProgramInfo {
   rapidLength: number;
   estimatedMinutes: number;
   warnings: string[];
+  /** Uses G28/G30/G53/G92/G10 or probing, whose moves can't be previewed or checked against the travel limits. */
+  unchecked: boolean;
 }
 
 const dist = (a: Vec3, b: Vec3) => Math.hypot(b[0] - a[0], b[1] - a[1], b[2] - a[2]);
@@ -34,6 +36,7 @@ const dist = (a: Vec3, b: Vec3) => Math.hypot(b[0] - a[0], b[1] - a[1], b[2] - a
 export function analyzeProgram(lines: string[], rapidRate = 1000): ProgramInfo {
   const moves: Move[] = [];
   const warnings = new Set<string>();
+  let unchecked = false;
   let pos: Vec3 = [0, 0, 0];
   let absolute = true;
   let scale = 1;
@@ -87,9 +90,11 @@ export function analyzeProgram(lines: string[], rapidRate = 1000): ProgramInfo {
           else if (value === 21) scale = 1;
           else if ([10, 28, 30, 53, 92].includes(value)) {
             nonModal = true;
+            unchecked = true;
             warnings.add(`G${value} changes coordinates in ways the preview does not follow.`);
           } else if (value === 38.2 || value === 38.3 || value === 38.4 || value === 38.5) {
             nonModal = true;
+            unchecked = true;
             warnings.add('Program contains probing moves; they are not previewed.');
           }
           break;
@@ -144,5 +149,6 @@ export function analyzeProgram(lines: string[], rapidRate = 1000): ProgramInfo {
     rapidLength,
     estimatedMinutes: minutes,
     warnings: [...warnings],
+    unchecked,
   };
 }

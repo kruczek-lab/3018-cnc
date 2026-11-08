@@ -9,8 +9,18 @@ export interface VersionInfo {
   branch: string;
 }
 
+export interface UpdateStatus {
+  state: 'running' | 'failed' | 'done';
+  /** Where it got to, e.g. 'building'. */
+  step: string;
+  /** When it was written, in ms since 1970 (the Pi's clock). */
+  time: number;
+}
+
 export interface SystemInfo {
   version: VersionInfo | null;
+  /** The outcome of the last update run, from pi/update.sh. */
+  lastUpdate: UpdateStatus | null;
   /** Why the app can't update itself, or null if it can. */
   updateBlocker: string | null;
   /** Why the Pi can't be shut down / restarted from the app, or null if it can. */
@@ -80,7 +90,13 @@ export class PiSystem implements SystemActions {
     const setupHint = 'Run "bash pi/install.sh" on the Pi once to allow this.';
     const powerBlocker = (await allowed(['poweroff'])) && (await allowed(['reboot'])) ? null : setupHint;
     if (!updateBlocker && !(await allowed(['start', '--no-block', '3018-studio-update.service']))) updateBlocker = setupHint;
-    return { version, updateBlocker, powerBlocker };
+    let lastUpdate: UpdateStatus | null = null;
+    try {
+      lastUpdate = JSON.parse(readFileSync(join(this.appDir, '.update-status'), 'utf8'));
+    } catch {
+      /* never updated from the app */
+    }
+    return { version, lastUpdate, updateBlocker, powerBlocker };
   }
 
   async checkForUpdates(): Promise<UpdateCheck> {

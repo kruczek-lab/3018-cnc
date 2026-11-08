@@ -4,3 +4,6 @@ dist-server/
 dist.old/
 dist-server.old/
 .build/
+.update-status
+test-results/
+playwright-report/

@@ -26,7 +26,7 @@ afterEach(async () => {
 async function start(password?: string, system?: SystemActions) {
   const dir = mkdtempSync(join(tmpdir(), 'studio-'));
   writeFileSync(join(dir, 'index.html'), '<h1>app</h1>');
-  studio = new StudioServer({ staticDir: dir, password, system });
+  studio = new StudioServer({ staticDir: dir, password, system, dataDir: mkdtempSync(join(tmpdir(), 'studio-data-')) });
   const port = await studio.listen(0, '127.0.0.1');
   const base = `http://127.0.0.1:${port}`;
   let cookie = '';
@@ -57,7 +57,6 @@ describe('StudioServer', () => {
     expect(started.body.job.lines).toBeUndefined();
     expect((await api('/api/job/start', { name: 'again', gcode })).status).toBe(409);
     await until(async () => (await api('/api/state')).body.job.status === 'finished');
-    expect((await api('/api/job/program')).body).toEqual({ name: 'test.nc', text: gcode });
     await until(async () => (await api('/api/state')).body.machine.wpos[0] === 10);
   });
 
@@ -101,7 +100,7 @@ class FakeSystem implements SystemActions {
   calls: string[] = [];
   blockers: Pick<SystemInfo, 'updateBlocker' | 'powerBlocker'> = { updateBlocker: null, powerBlocker: null };
   async info(): Promise<SystemInfo> {
-    return { version: { commit: 'abc1234', date: '2026-11-07T10:00:00Z', subject: 'Test', branch: 'main' }, ...this.blockers };
+    return { version: { commit: 'abc1234', date: '2026-11-07T10:00:00Z', subject: 'Test', branch: 'main' }, lastUpdate: null, ...this.blockers };
   }
   async checkForUpdates() {
     return { behind: 1, commits: ['def5678 Add something'] };

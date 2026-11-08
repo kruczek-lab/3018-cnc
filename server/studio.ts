@@ -7,9 +7,10 @@ import { SimulatedGrbl } from '../src/machine/simulator';
 import type { Transport } from '../src/machine/transport';
 import { prepareProgram } from '../src/gcode/clean';
 import { LinuxSerialTransport, listSerialPorts } from './linuxSerial';
-import { LimitError } from '../src/machine/controller';
+import { LimitError, OVERRIDES } from '../src/machine/controller';
 import type { Vec3 } from '../src/machine/status';
 import type { SystemActions } from './system';
+import { FileStore, type NewFile } from './files';
 
 export interface StudioOptions {
   /** Folder with the built web app (dist/). */
@@ -22,6 +23,8 @@ export interface StudioOptions {
   openPort?: (path: string) => Transport;
   /** Shutdown, restart and self-update. Without it those requests are refused. */
   system?: SystemActions;
+  /** Where files and shared settings are kept. Without it those requests are refused. */
+  dataDir?: string;
 }
 
 export interface LogEntry {
@@ -70,7 +73,7 @@ export class StudioServer {
   readonly controller = new GrblController();
   readonly server: Server;
   private port: string | null = null;
-  private program: { name: string; text: string } | null = null;
+  private store: FileStore | null;
   private log: LogEntry[] = [];
   private nextLogId = 1;
   private clients = new Set<ServerResponse>();
@@ -78,6 +81,7 @@ export class StudioServer {
   private sessions = new Set<string>();
 
   constructor(private options: StudioOptions) {
+    this.store = options.dataDir ? new FileStore(options.dataDir) : null;
     this.server = createServer((req, res) => {
       this.handle(req, res).catch((error) => {
         const status = error instanceof HttpError ? error.status : 500;
@@ -114,7 +118,7 @@ export class StudioServer {
     const job = this.controller.job;
     // Everything but the (possibly huge) list of lines.
     const view: JobView | null = job && {
-      name: job.name, kind: job.kind, total: job.total, sent: job.sent, acked: job.acked, status: job.status, message: job.message,
+      name: job.name, kind: job.kind, source: job.source, lineOffset: job.lineOffset, total: job.total, sent: job.sent, acked: job.acked, status: job.status, message: job.message,
       startedAt: job.startedAt, finishedAt: job.finishedAt, pausedMs: job.pausedMs, pauseStartedAt: job.pauseStartedAt,
     };
     return { machine: this.controller.machine, job: view, port: this.port, serverNow: Date.now() };
@@ -139,6 +143,11 @@ export class StudioServer {
         : message);
     }
     this.port = path;
+  }
+
+  private requireStore(): FileStore {
+    if (!this.store) throw new HttpError(501, 'No storage on this server');
+    return this.store;
   }
 
   private requireSystem(): SystemActions {
@@ -229,11 +238,18 @@ export class StudioServer {
           return this.json(res, 200, this.state());
         case '/api/ports':
           return this.json(res, 200, { ports: listSerialPorts() });
-        case '/api/job/program':
-          if (!this.program) throw new HttpError(404, 'No job has been sent');
-          return this.json(res, 200, this.program);
+        case '/api/files':
+          return this.json(res, 200, { files: this.requireStore().list() });
+        case '/api/settings':
+          return this.json(res, 200, { values: this.requireStore().settings() });
         case '/api/events':
           return this.events(req, res);
+      }
+      const fileId = /^\/api\/files\/([a-z0-9]+)$/.exec(path)?.[1];
+      if (fileId) {
+        const file = this.requireStore().get(fileId);
+        if (!file) throw new HttpError(404, 'No such file');
+        return this.json(res, 200, file);
       }
       throw new HttpError(404, 'Not found');
     }
@@ -253,10 +269,11 @@ export class StudioServer {
       case '/api/command': {
         if (typeof body.line !== 'string') throw new HttpError(400, 'Missing line');
         if (!c.connected) throw new HttpError(409, 'Machine not connected');
+        if (c.jobActive) throw new HttpError(409, 'A job is running; commands would end up in the middle of it');
         return this.json(res, 200, { response: await c.send(body.line) });
       }
       case '/api/realtime': {
-        const commands: Record<string, '?' | '!' | '~' | number> = { status: '?', hold: '!', resume: '~', jogCancel: 0x85 };
+        const commands: Record<string, '?' | '!' | '~' | number> = { status: '?', hold: '!', resume: '~', jogCancel: 0x85, ...OVERRIDES };
         const command = commands[String(body.command)];
         if (command === undefined) throw new HttpError(400, 'Unknown real-time command');
         c.realtime(command);
@@ -270,14 +287,46 @@ export class StudioServer {
         if (!c.connected) throw new HttpError(409, 'Machine not connected');
         if (c.jobActive) throw new HttpError(409, 'A job is already running');
         const kind = body.kind === 'trace' ? 'trace' : 'job';
+        const source = typeof body.source === 'string' ? body.source : undefined;
+        const lineOffset = typeof body.lineOffset === 'number' ? body.lineOffset : undefined;
         try {
-          c.startJob(body.name, prepareProgram(body.gcode), { kind, ignoreLimits: body.ignoreLimits === true });
+          c.startJob(body.name, prepareProgram(body.gcode), { kind, source, lineOffset, ignoreLimits: body.ignoreLimits === true });
         } catch (error) {
           if (error instanceof LimitError) throw new HttpError(409, error.message);
           throw error;
         }
-        if (kind === 'job') this.program = { name: body.name, text: body.gcode };
         return this.json(res, 200, this.state());
+      }
+      case '/api/files': {
+        const store = this.requireStore();
+        const { name, tool, summary, gcode, layers } = body as Partial<NewFile>;
+        if (typeof name !== 'string' || !name.trim() || name.length > 200 || typeof gcode !== 'string') {
+          throw new HttpError(400, 'A file needs a name and G-code');
+        }
+        const meta = store.add({
+          name: name.trim(),
+          tool: typeof tool === 'string' ? tool.slice(0, 200) : '',
+          summary: typeof summary === 'string' ? summary.slice(0, 500) : '',
+          gcode,
+          layers: layers && typeof layers === 'object' ? layers : {},
+        });
+        this.broadcast('files', { files: store.list() });
+        return this.json(res, 201, meta);
+      }
+      case '/api/files/delete': {
+        const store = this.requireStore();
+        if (typeof body.id !== 'string' || !store.remove(body.id)) throw new HttpError(404, 'No such file');
+        this.broadcast('files', { files: store.list() });
+        return this.json(res, 200, { ok: true });
+      }
+      case '/api/settings': {
+        const values = body.values;
+        const ok = values && typeof values === 'object' && !Array.isArray(values)
+          && Object.keys(values).length <= 200
+          && Object.entries(values).every(([k, v]) => k.length <= 64 && (typeof v === 'boolean' || (typeof v === 'string' && v.length <= 200)));
+        if (!ok) throw new HttpError(400, 'Invalid settings');
+        this.requireStore().saveSettings(values as Record<string, string | boolean>);
+        return this.json(res, 200, { ok: true });
       }
       case '/api/limits/reference': {
         const size = body.size;
@@ -317,9 +366,10 @@ export class StudioServer {
         if (c.jobActive) throw new HttpError(409, 'Wait for the job to finish before updating');
         const { updateBlocker } = await system.info();
         if (updateBlocker) throw new HttpError(409, updateBlocker);
+        const requestedAt = Date.now();
         await system.startUpdate();
         this.addLog('info', 'Updating 3018 Studio on the Pi. This takes a few minutes; the page reloads when it is done.');
-        return this.json(res, 202, { ok: true });
+        return this.json(res, 202, { ok: true, requestedAt });
       }
       case '/api/system/power': {
         const action = body.action;
@@ -354,6 +404,7 @@ export class StudioServer {
     });
     res.write('retry: 2000\n\n');
     res.write(`event: state\ndata: ${JSON.stringify(this.state())}\n\n`);
+    if (this.store) res.write(`event: files\ndata: ${JSON.stringify({ files: this.store.list() })}\n\n`);
     for (const entry of this.log) res.write(`event: log\ndata: ${JSON.stringify(entry)}\n\n`);
     this.clients.add(res);
     req.on('close', () => this.clients.delete(res));

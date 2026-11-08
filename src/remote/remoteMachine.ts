@@ -1,4 +1,4 @@
-import type { JobView, LogKind, MachineState, StartOptions } from '../machine/controller';
+import { OVERRIDES, type JobView, type LogKind, type MachineState, type StartOptions } from '../machine/controller';
 import type { Vec3 } from '../machine/status';
 import type { MachineClient } from '../machine/client';
 
@@ -19,8 +19,31 @@ export interface RemoteInfo {
   ports: string[];
 }
 
+export interface RemoteFileMeta {
+  id: string;
+  name: string;
+  tool: string;
+  summary: string;
+  createdAt: number;
+}
+
+export interface RemoteStoredLayer {
+  png: string;
+  width: number;
+  height: number;
+  x?: number;
+  y?: number;
+  rotation?: number;
+}
+
+export interface RemoteFile extends RemoteFileMeta {
+  gcode: string;
+  layers: { block?: RemoteStoredLayer; print?: RemoteStoredLayer };
+}
+
 export interface SystemInfo {
   version: { commit: string; date: string; subject: string; branch: string } | null;
+  lastUpdate: { state: 'running' | 'failed' | 'done'; step: string; time: number } | null;
   updateBlocker: string | null;
   powerBlocker: string | null;
 }
@@ -45,7 +68,9 @@ export async function detectRemote(): Promise<RemoteInfo | null> {
   if (location.protocol === 'file:') return null;
   for (;;) {
     try {
-      return await api<RemoteInfo>('api/info');
+      const info = await api<RemoteInfo & { app?: string }>('api/info');
+      // Other web servers (e.g. the dev server) answer any address with the app's page.
+      return info.app === '3018-studio' ? info : null;
     } catch (error) {
       const status = (error as { status?: number }).status;
       if (status !== 401) return null;
@@ -61,6 +86,7 @@ export class RemoteMachine implements MachineClient {
   machine: MachineState = {
     connected: false, transportName: '', state: 'Disconnected', mpos: [0, 0, 0], wpos: [0, 0, 0],
     wco: [0, 0, 0], feed: 0, spindle: 0, version: '', limits: null, homingEnabled: false,
+    overrides: [100, 100, 100], zeroUnverified: '',
   };
   job: JobView | null = null;
   port: string | null = null;
@@ -71,11 +97,16 @@ export class RemoteMachine implements MachineClient {
   private clockOffset = 0;
   private lastLogId = 0;
   private changeListeners = new Set<() => void>();
+  private filesListeners = new Set<(files: RemoteFileMeta[]) => void>();
   private logListeners = new Set<(kind: LogKind, text: string) => void>();
 
   constructor() {
     const events = new EventSource('api/events');
     events.addEventListener('state', (e) => this.applyState(JSON.parse((e as MessageEvent).data)));
+    events.addEventListener('files', (e) => {
+      const { files } = JSON.parse((e as MessageEvent).data) as { files: RemoteFileMeta[] };
+      for (const fn of this.filesListeners) fn(files);
+    });
     events.addEventListener('log', (e) => {
       const entry: LogEntry = JSON.parse((e as MessageEvent).data);
       if (entry.id <= this.lastLogId) return;
@@ -129,7 +160,8 @@ export class RemoteMachine implements MachineClient {
   }
 
   realtime(command: '?' | '!' | '~' | number): void {
-    const name = { '?': 'status', '!': 'hold', '~': 'resume' }[command as string] ?? (command === 0x85 ? 'jogCancel' : null);
+    const byByte = Object.entries({ jogCancel: 0x85, ...OVERRIDES }).find(([, b]) => b === command)?.[0];
+    const name = typeof command === 'string' ? { '?': 'status', '!': 'hold', '~': 'resume' }[command] : byByte;
     if (name) void this.call('api/realtime', { command: name });
   }
 
@@ -175,18 +207,39 @@ export class RemoteMachine implements MachineClient {
     return api('api/system/check-updates', {});
   }
 
-  /** Starts the update on the Pi; the page should reload once the Pi is back. */
-  update(): Promise<unknown> {
-    return api('api/system/update', {});
+  /** Starts the update on the Pi; resolves with the Pi's clock time of the request. */
+  async update(): Promise<number> {
+    return (await api<{ requestedAt: number }>('api/system/update', {})).requestedAt;
   }
 
   power(action: 'poweroff' | 'reboot'): Promise<unknown> {
     return api('api/system/power', { action });
   }
 
-  /** The G-code of the current/last job, for previewing a job started from another device. */
-  program(): Promise<{ name: string; text: string }> {
-    return api('api/job/program');
+  /** Called with the Pi's file list whenever it changes (and once on connecting). */
+  onFiles(fn: (files: RemoteFileMeta[]) => void): void {
+    this.filesListeners.add(fn);
+  }
+
+  addFile(file: Omit<RemoteFile, 'id' | 'createdAt'>): Promise<RemoteFileMeta> {
+    return api('api/files', file);
+  }
+
+  getFile(id: string): Promise<RemoteFile> {
+    return api(`api/files/${encodeURIComponent(id)}`);
+  }
+
+  async removeFile(id: string): Promise<void> {
+    await api('api/files/delete', { id });
+  }
+
+  /** Settings shared by every device using this Pi (bit sizes, feeds, travel …). */
+  async settings(): Promise<Record<string, string | boolean>> {
+    return (await api<{ values: Record<string, string | boolean> }>('api/settings')).values;
+  }
+
+  async saveSettings(values: Record<string, string | boolean>): Promise<void> {
+    await api('api/settings', { values });
   }
 
   private async call(path: string, body: unknown): Promise<void> {
