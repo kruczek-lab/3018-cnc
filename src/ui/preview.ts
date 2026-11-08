@@ -166,6 +166,8 @@ export class PreviewCanvas {
   private draw(): void {
     const { ctx, canvas } = this;
     const dpr = window.devicePixelRatio || 1;
+    // Pixels per mm, exposed for the browser tests.
+    canvas.dataset.zoom = this.scale.toFixed(3);
     ctx.setTransform(1, 0, 0, 1, 0, 0);
     ctx.fillStyle = css('--canvas-bg');
     ctx.fillRect(0, 0, canvas.width, canvas.height);
@@ -299,22 +301,44 @@ export class PreviewCanvas {
       this.scale *= factor;
       this.redraw();
     }, { passive: false });
-    let drag: { x: number; y: number } | null = null;
+    // One finger (or the mouse) pans; two fingers pinch to zoom around the point between them.
+    const pointers = new Map<number, { x: number; y: number }>();
+    let last: { x: number; y: number; spread: number } | null = null;
+    const gesture = () => {
+      const pts = [...pointers.values()];
+      const x = pts.reduce((sum, p) => sum + p.x, 0) / pts.length;
+      const y = pts.reduce((sum, p) => sum + p.y, 0) / pts.length;
+      const spread = pts.length > 1 ? Math.hypot(pts[0].x - pts[1].x, pts[0].y - pts[1].y) : 0;
+      return { x, y, spread };
+    };
     c.addEventListener('pointerdown', (e) => {
-      drag = { x: e.clientX, y: e.clientY };
+      pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
       c.setPointerCapture(e.pointerId);
       c.style.cursor = 'grabbing';
+      last = gesture();
     });
     c.addEventListener('pointermove', (e) => {
-      if (!drag) return;
-      this.ox += e.clientX - drag.x;
-      this.oy += e.clientY - drag.y;
-      drag = { x: e.clientX, y: e.clientY };
+      if (!pointers.has(e.pointerId) || !last) return;
+      pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+      const now = gesture();
+      const rect = c.getBoundingClientRect();
+      if (now.spread && last.spread) {
+        const factor = now.spread / last.spread;
+        const mx = last.x - rect.left;
+        const my = last.y - rect.top;
+        this.ox = mx - (mx - this.ox) * factor;
+        this.oy = my - (my - this.oy) * factor;
+        this.scale *= factor;
+      }
+      this.ox += now.x - last.x;
+      this.oy += now.y - last.y;
+      last = now;
       this.redraw();
     });
-    const end = () => {
-      drag = null;
-      c.style.cursor = '';
+    const end = (e: PointerEvent) => {
+      pointers.delete(e.pointerId);
+      last = pointers.size ? gesture() : null;
+      if (!pointers.size) c.style.cursor = '';
     };
     c.addEventListener('pointerup', end);
     c.addEventListener('pointercancel', end);
