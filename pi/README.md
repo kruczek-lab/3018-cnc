@@ -168,7 +168,11 @@ and copying again.
 
 ```
 sudo systemctl disable --now 3018-studio
-sudo rm /etc/systemd/system/3018-studio.service /etc/systemd/system/3018-studio-update.service
-sudo rm /etc/default/3018-studio /etc/sudoers.d/3018-studio
+sudo rm -f /etc/systemd/system/3018-studio.service /etc/systemd/system/3018-studio-update.service
+sudo rm -f /etc/sudoers.d/3018-studio
+sudo systemctl daemon-reload
 rm -rf ~/studio
 ```
+Use your app folder's name in the last line if it isn't `studio`. Your settings and password
+stay in `/etc/default/3018-studio`, ready for a reinstall; to remove those too:
+`sudo rm -f /etc/default/3018-studio`.
